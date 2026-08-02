@@ -26,7 +26,8 @@ func humanDuration(sec float64) string {
 func printReport(sys *SysStats, db *DBStats, wl Workload, plan []PlanItem, qa *QueryAnalysis) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 
-	fmt.Fprintln(w, "\n=== pgtune report ===\n")
+	fmt.Fprintln(w, "\n=== pgtune report ===")
+	fmt.Fprintln(w)
 	fmt.Fprintf(w, "PostgreSQL\t: %s\n", db.Version)
 	fmt.Fprintf(w, "Database\t: %s (%s)\n", db.Database, fmtBytes(uint64(db.DatabaseSizeBytes)))
 	fmt.Fprintf(w, "Uptime\t: %s\n", humanDuration(db.UptimeSec))
