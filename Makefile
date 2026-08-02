@@ -5,6 +5,7 @@
 # Common targets:
 #   make help           - list all targets
 #   make build          - compile the pgtune binary
+#   make test           - run the unit tests
 #   make tune           - auto-tune: gather stats + apply tuning plan (needs sudo for ALTER SYSTEM)
 #   make tune-index     - create indexes recommended by seq-scan findings
 #   make tune-restart   - full config tune incl. pg_stat_statements install + restart + ANALYZE
@@ -40,11 +41,12 @@ PROGRESS  ?= 5
 
 PG_CONN := PGPASSWORD=$(PGPASSWORD) pgbench -h $(PGHOST) -p $(PGPORT) -U $(PGUSER) -d $(PGDATABASE)
 
-.PHONY: help build tune tune-index tune-restart tune-full tune-dry tune-olap pgss-reset load load-init load-readonly load-custom load-init-if-needed
+.PHONY: help build test tune tune-index tune-restart tune-full tune-dry tune-olap pgss-reset load load-init load-readonly load-custom load-init-if-needed
 
 help:
 	@echo "pgtune targets:"
 	@echo "  make build          compile the pgtune binary"
+	@echo "  make test           run the unit tests (no database needed)"
 	@echo "  make tune           auto-tune postgres (stats + apply, workload=$(WORKLOAD))"
 	@echo "  make tune-index     create indexes recommended by seq-scan findings"
 	@echo "  make tune-restart   full config tune: pg_stat_statements + restart + ANALYZE"
@@ -59,6 +61,10 @@ help:
 ## Compile the pgtune binary.
 build:
 	$(GO) build -o pgtune .
+
+## Run the unit tests (pure logic: plan math, EXPLAIN analysis, DDL parsing).
+test:
+	$(GO) test -count=1 ./...
 
 ## Auto-tune: gather stats, apply plan, reload (restarts only if required).
 tune: build

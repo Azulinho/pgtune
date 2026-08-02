@@ -213,6 +213,9 @@ func verifyIndexPlan(ctx context.Context, conn *pgx.Conn, q TopQuery, schema, ta
 
 // topQueryByID returns the TopQuery with the given queryid.
 func topQueryByID(qa *QueryAnalysis, id int64) *TopQuery {
+	if qa == nil {
+		return nil
+	}
 	for i := range qa.Top {
 		if qa.Top[i].QueryID == id {
 			return &qa.Top[i]

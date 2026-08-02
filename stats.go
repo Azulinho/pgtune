@@ -21,12 +21,12 @@ type SysStats struct {
 
 // Setting is one row of pg_settings.
 type Setting struct {
-	Name          string
-	Value         string // value in the parameter's base unit
-	Unit          string
-	Ctx           string
-	VarType       string
-	Source        string
+	Name           string
+	Value          string // value in the parameter's base unit
+	Unit           string
+	Ctx            string
+	VarType        string
+	Source         string
 	PendingRestart bool
 }
 

@@ -133,4 +133,5 @@ make load DURATION=30          # after
 | `tune.go` | tuning formulas + evidence-based adjustments |
 | `apply.go` | ALTER SYSTEM / reload / pg_stat_statements install / ANALYZE / restart |
 | `report.go` | terminal report rendering |
+| `*_test.go` | unit tests for plan math, EXPLAIN analysis, and DDL parsing (`make test`; no database needed) |
 | `Makefile` | build, tune, and load-test targets |

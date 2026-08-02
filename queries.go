@@ -35,17 +35,17 @@ type LongRunning struct {
 
 // TableStat is one row of pg_stat_user_tables joined with pg_statio.
 type TableStat struct {
-	Schema, Table                     string
-	SeqScan, IdxScan                  int64
-	BlksHit, BlksRead                 int64
-	Live, Dead                        int64
-	Upd, Del                          int64
-	DeadPct                           float64
-	LastVacuum                        *time.Time
-	LastAutoVacuum                    *time.Time
-	LastAnalyze                       *time.Time
-	LastAutoAnalyze                   *time.Time
-	SizeBytes                         int64
+	Schema, Table     string
+	SeqScan, IdxScan  int64
+	BlksHit, BlksRead int64
+	Live, Dead        int64
+	Upd, Del          int64
+	DeadPct           float64
+	LastVacuum        *time.Time
+	LastAutoVacuum    *time.Time
+	LastAnalyze       *time.Time
+	LastAutoAnalyze   *time.Time
+	SizeBytes         int64
 }
 
 // Finding is a detected problem with an actionable suggestion.
@@ -300,9 +300,9 @@ func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, e
 			}
 			if err := conn.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+sql).Scan(&out); err != nil {
 				qa.Findings = append(qa.Findings, Finding{
-					Kind:    "explain-error",
-					QueryID: q.QueryID,
-					Detail:  fmt.Sprintf("EXPLAIN ANALYZE failed: %v", err),
+					Kind:       "explain-error",
+					QueryID:    q.QueryID,
+					Detail:     fmt.Sprintf("EXPLAIN ANALYZE failed: %v", err),
 					Suggestion: "query may be slow or not executable in this session",
 				})
 				done++
@@ -344,10 +344,10 @@ func countParams(q string) int {
 }
 
 var (
-	probeWhereRe    = regexp.MustCompile(`(?i)\bwhere\s+([a-zA-Z_][a-zA-Z0-9_$\.]*?)\s*(=|<>|!=|<=|>=|<|>)\s*\$(\d+)`)
-	probeBetweenRe  = regexp.MustCompile(`(?i)\bwhere\s+([a-zA-Z_][a-zA-Z0-9_$\.]*?)\s+between\s+\$(\d+)\s+and\s+\$(\d+)`)
-	probeFromRe     = regexp.MustCompile(`(?i)\bfrom\s+([a-zA-Z_][a-zA-Z0-9_$]*(?:\.[a-zA-Z_][a-zA-Z0-9_$]*)?)`)
-	probeNumericRe  = regexp.MustCompile(`^-?\d+(\.\d+)?$`)
+	probeWhereRe   = regexp.MustCompile(`(?i)\bwhere\s+([a-zA-Z_][a-zA-Z0-9_$\.]*?)\s*(=|<>|!=|<=|>=|<|>)\s*\$(\d+)`)
+	probeBetweenRe = regexp.MustCompile(`(?i)\bwhere\s+([a-zA-Z_][a-zA-Z0-9_$\.]*?)\s+between\s+\$(\d+)\s+and\s+\$(\d+)`)
+	probeFromRe    = regexp.MustCompile(`(?i)\bfrom\s+([a-zA-Z_][a-zA-Z0-9_$]*(?:\.[a-zA-Z_][a-zA-Z0-9_$]*)?)`)
+	probeNumericRe = regexp.MustCompile(`^-?\d+(\.\d+)?$`)
 )
 
 // probeValues picks realistic probe values for the $n placeholders of a
