@@ -6,12 +6,17 @@
 #   make help           - list all targets
 #   make build          - compile the pgtune binary
 #   make tune           - auto-tune: gather stats + apply tuning plan (needs sudo for ALTER SYSTEM)
-#   make tune-restart   - full auto-tune incl. pg_stat_statements install + restart + ANALYZE
+#   make tune-index     - create indexes recommended by seq-scan findings
+#   make tune-restart   - full config tune incl. pg_stat_statements install + restart + ANALYZE
+#   make tune-full      - everything: tune + restart + ANALYZE + recommended indexes
 #   make tune-dry       - gather stats and show the plan without applying
 #   make tune-olap      - same as tune but for an analytics workload
+#   make pgss-reset     - clear pg_stat_statements (run before a benchmark)
 #   make load           - run the pgbench read/write benchmark
 #   make load-readonly  - SELECT-only benchmark
 #   make load-custom F=script.sql - custom pgbench script
+#
+# Workflow: make load ; make tune-full ; make load   (measure -> tune -> measure)
 
 # --- pgtune app ---
 GO      ?= go
@@ -25,23 +30,28 @@ PGUSER    ?= app
 PGPASSWORD?= app
 PGDATABASE?= app
 
-CLIENTS   ?= 20            # -c  concurrent clients
-THREADS   ?= 8             # -j  threads
-DURATION  ?= 60            # -T  seconds
-SCALE     ?= 10            # -s  benchmark schema scale factor
-PROGRESS  ?= 5             # -P  progress report interval (s)
+CLIENTS   ?= 20
+THREADS   ?= 8
+DURATION  ?= 60
+SCALE     ?= 10
+PROGRESS  ?= 5
+# pgbench flags: CLIENTS=-c concurrent clients, THREADS=-j threads,
+# DURATION=-T seconds, SCALE=-s schema scale, PROGRESS=-P report interval
 
 PG_CONN := PGPASSWORD=$(PGPASSWORD) pgbench -h $(PGHOST) -p $(PGPORT) -U $(PGUSER) -d $(PGDATABASE)
 
-.PHONY: help build tune tune-restart tune-dry tune-olap load load-init load-readonly load-custom load-init-if-needed
+.PHONY: help build tune tune-index tune-restart tune-full tune-dry tune-olap pgss-reset load load-init load-readonly load-custom load-init-if-needed
 
 help:
 	@echo "pgtune targets:"
 	@echo "  make build          compile the pgtune binary"
 	@echo "  make tune           auto-tune postgres (stats + apply, workload=$(WORKLOAD))"
-	@echo "  make tune-restart   full auto-tune: pg_stat_statements install + restart + ANALYZE"
+	@echo "  make tune-index     create indexes recommended by seq-scan findings"
+	@echo "  make tune-restart   full config tune: pg_stat_statements + restart + ANALYZE"
+	@echo "  make tune-full      everything: tune + restart + ANALYZE + recommended indexes"
 	@echo "  make tune-dry       show stats and plan without applying"
 	@echo "  make tune-olap      auto-tune for an analytics workload"
+	@echo "  make pgss-reset     clear pg_stat_statements (before/after benchmark)"
 	@echo "  make load           run pgbench read/write benchmark (defaults: $(CLIENTS) clients, $(DURATION)s)"
 	@echo "  make load-readonly  SELECT-only benchmark"
 	@echo "  make load-custom F=script.sql   run a custom pgbench script"
@@ -54,10 +64,19 @@ build:
 tune: build
 	$(PGTUNE) -apply -workload $(WORKLOAD)
 
+## Create the indexes recommended by seq-scan findings (CONCURRENTLY,
+## skips unselective predicates and existing covering indexes, verifies).
+tune-index: build
+	$(PGTUNE) -apply-index
+
 ## Full auto-tune: install pg_stat_statements, apply plan, ANALYZE stale
 ## statistics, restart once if required. Use this on a fresh instance.
 tune-restart: build
 	$(PGTUNE) -apply -restart -analyze -workload $(WORKLOAD)
+
+## One-shot: config tune + restart if needed + ANALYZE + recommended indexes.
+tune-full: build
+	$(PGTUNE) -apply -restart -analyze -apply-index -workload $(WORKLOAD)
 
 ## Show stats and tuning plan without changing anything.
 tune-dry: build
@@ -66,6 +85,10 @@ tune-dry: build
 ## Auto-tune for an analytics/warehouse workload.
 tune-olap: build
 	$(PGTUNE) -apply -workload olap
+
+## Clear pg_stat_statements so query stats start from zero (needs sudo).
+pgss-reset:
+	sudo -u postgres psql -d $(PGDATABASE) -c "SELECT pg_stat_statements_reset();"
 
 ## Run the default TPC-B-like read/write workload.
 ## Initializes the schema first if the pgbench_accounts table is missing.
