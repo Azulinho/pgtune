@@ -20,6 +20,7 @@ const (
 const (
 	MiB = uint64(1 << 20)
 	GiB = uint64(1 << 30)
+	KiB = uint64(1 << 10)
 )
 
 func parseWorkload(s string) (Workload, error) {
@@ -58,13 +59,22 @@ const (
 )
 
 func fmtBytes(b uint64) string {
-	if b >= GiB && b%GiB == 0 {
+	switch {
+	case b >= GiB && b%GiB == 0:
 		return fmt.Sprintf("%dGB", b/GiB)
-	}
-	if b >= MiB && b%MiB == 0 {
+	case b >= GiB:
+		return fmt.Sprintf("%.1fGB", float64(b)/float64(GiB))
+	case b >= MiB && b%MiB == 0:
 		return fmt.Sprintf("%dMB", b/MiB)
+	case b >= MiB:
+		return fmt.Sprintf("%.1fMB", float64(b)/float64(MiB))
+	case b >= KiB && b%KiB == 0:
+		return fmt.Sprintf("%dKB", b/KiB)
+	case b >= KiB:
+		return fmt.Sprintf("%.1fKB", float64(b)/float64(KiB))
+	default:
+		return fmt.Sprintf("%dB", b)
 	}
-	return fmt.Sprintf("%dB", b)
 }
 
 // parseBytes converts a pg_settings value (in its base unit) to bytes.
@@ -209,11 +219,21 @@ func buildPlan(sys *SysStats, db *DBStats, wl Workload, qa *QueryAnalysis) []Pla
 					maxSort = f.Bytes
 				}
 			}
+			// The reported spill is only the part that overflowed the *current*
+			// work_mem; the sort needs work_mem + spill to fit in memory.
+			// E.g. work_mem=34MB + 17MB spilled = sort needs ~51MB.
+			curWorkMem := uint64(0)
+			if s, ok := db.Settings["work_mem"]; ok {
+				if cur, err := parseBytes(s.Value, s.Unit); err == nil && uint64(cur) > 0 {
+					curWorkMem = uint64(cur)
+				}
+			}
+			needed := maxSort + curWorkMem // in-memory portion + what spilled
 			hardCap := (ram - shared - mwm) / uint64(maxConn+int(avWorkers))
 			if hardCap > 64*MiB {
 				hardCap = 64 * MiB
 			}
-			ev := maxSort * 2 // headroom above the largest observed spill
+			ev := needed // already includes headroom (the in-memory portion)
 			if ev > hardCap {
 				ev = hardCap
 			}
@@ -223,7 +243,7 @@ func buildPlan(sys *SysStats, db *DBStats, wl Workload, qa *QueryAnalysis) []Pla
 			}
 			if ev > workMem {
 				workMem = ev
-				notes["work_mem"] = fmt.Sprintf("%d sort(s)/spill(s) hit disk (largest %s)", spills, fmtBytes(maxSort))
+				notes["work_mem"] = fmt.Sprintf("%d sort(s)/spill(s) hit disk (sort needs ~%s at current work_mem %s)", spills, fmtBytes(needed), fmtBytes(curWorkMem))
 			}
 		}
 
