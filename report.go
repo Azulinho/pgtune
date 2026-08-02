@@ -171,6 +171,19 @@ func printQueryAnalysis(w *tabwriter.Writer, qa *QueryAnalysis) {
 				where = " [" + f.Table + "]"
 			}
 			fmt.Fprintf(w, "  ! %s%s — %s\n", f.Detail, where, f.Suggestion)
+			if f.IndexDDL != "" {
+				if est, total, ok := indexSelectivity(&f, qa.Tables); ok {
+					pct := est / total * 100
+					if pct <= 10 {
+						fmt.Fprintf(w, "      index: %s\n", f.IndexDDL)
+						fmt.Fprintf(w, "      matches ~%.0f of %.0f rows (%.3f%% of table) — create it with -apply-index\n", est, total, pct)
+					} else {
+						fmt.Fprintf(w, "      matches ~%.0f of %.0f rows (%.1f%% of table) — low selectivity, index may not help\n", est, total, pct)
+					}
+				} else {
+					fmt.Fprintf(w, "      index: %s\n", f.IndexDDL)
+				}
+			}
 		}
 		w.Flush()
 	} else {

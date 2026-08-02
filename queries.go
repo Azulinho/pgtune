@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +39,7 @@ type TableStat struct {
 	SeqScan, IdxScan                  int64
 	BlksHit, BlksRead                 int64
 	Live, Dead                        int64
+	Upd, Del                          int64
 	DeadPct                           float64
 	LastVacuum                        *time.Time
 	LastAutoVacuum                    *time.Time
@@ -54,6 +56,8 @@ type Finding struct {
 	Bytes      uint64
 	Detail     string
 	Suggestion string
+	IndexDDL   string // suggested CREATE INDEX statement (seq-scan findings)
+	EstRows    int64  // planner estimate of rows matching the filter
 }
 
 // QueryAnalysis is the collected workload intelligence.
@@ -119,6 +123,7 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options) (*Q
 		JOIN pg_database d ON d.oid = s.dbid
 		WHERE d.datname = current_database()
 		  AND s.query NOT ILIKE 'EXPLAIN%'
+		  AND s.query <> '<insufficient privilege>'
 		ORDER BY s.total_exec_time DESC
 		LIMIT $1`, opts.TopN)
 	if err != nil {
@@ -174,6 +179,7 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options) (*Q
 		       COALESCE(s.seq_scan,0), COALESCE(s.idx_scan,0),
 		       COALESCE(st.heap_blks_hit,0), COALESCE(st.heap_blks_read,0),
 		       COALESCE(s.n_live_tup,0), COALESCE(s.n_dead_tup,0),
+		       COALESCE(s.n_tup_upd,0), COALESCE(s.n_tup_del,0),
 		       s.last_vacuum, s.last_autovacuum, s.last_analyze, s.last_autoanalyze,
 		       pg_total_relation_size(c.oid)
 		FROM pg_stat_user_tables s
@@ -188,7 +194,7 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options) (*Q
 			var t TableStat
 			var lv, lav, la, laa *time.Time
 			if err := tb.Scan(&t.Schema, &t.Table, &t.SeqScan, &t.IdxScan,
-				&t.BlksHit, &t.BlksRead, &t.Live, &t.Dead,
+				&t.BlksHit, &t.BlksRead, &t.Live, &t.Dead, &t.Upd, &t.Del,
 				&lv, &lav, &la, &laa, &t.SizeBytes); err != nil {
 				tb.Close()
 				return nil, err
@@ -245,9 +251,9 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options) (*Q
 }
 
 // explainTopQueries runs EXPLAIN on the top queries. SELECT-only queries are
-// safe to ANALYZE; parameterized ones get a GENERIC_PLAN (plan shape, no
-// execution) with dummy bound values — in generic mode PostgreSQL ignores the
-// actual values. DML is skipped (EXPLAIN ANALYZE would execute it).
+// safe to ANALYZE; parameterized ones get a plain EXPLAIN (no execution) with
+// bound values so the planner estimates selectivity realistically. DML is
+// skipped (EXPLAIN ANALYZE would execute it).
 func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, explainN int) {
 	if conn == nil || explainN <= 0 {
 		return
@@ -269,13 +275,23 @@ func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, e
 
 		var out string
 		if q.HasParams {
-			// generic plan: bind dummy values, PostgreSQL ignores them in
-			// GENERIC_PLAN mode but needs them for protocol-level binding.
+			// plain EXPLAIN (not ANALYZE, not GENERIC_PLAN): no execution, but
+			// the planner uses the bound values, giving realistic row estimates
+			// (GENERIC_PLAN would assume ~1/3 selectivity for every predicate).
+			// Probe values are derived from pg_stats histograms when the WHERE
+			// clause targets a plain column; otherwise dummy 1 is bound.
 			args := make([]any, countParams(sql))
 			for i := range args {
 				args[i] = 1
 			}
-			if err := conn.QueryRow(ctx, "EXPLAIN (GENERIC_PLAN, FORMAT JSON) "+sql, args...).Scan(&out); err != nil {
+			if probe, ok := probeValues(ctx, conn, sql); ok {
+				for k, v := range probe {
+					if k >= 1 && k <= len(args) {
+						args[k-1] = v
+					}
+				}
+			}
+			if err := conn.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+sql, args...).Scan(&out); err != nil {
 				continue
 			}
 		} else {
@@ -327,6 +343,109 @@ func countParams(q string) int {
 	}
 }
 
+var (
+	probeWhereRe    = regexp.MustCompile(`(?i)\bwhere\s+([a-zA-Z_][a-zA-Z0-9_$\.]*?)\s*(=|<>|!=|<=|>=|<|>)\s*\$(\d+)`)
+	probeBetweenRe  = regexp.MustCompile(`(?i)\bwhere\s+([a-zA-Z_][a-zA-Z0-9_$\.]*?)\s+between\s+\$(\d+)\s+and\s+\$(\d+)`)
+	probeFromRe     = regexp.MustCompile(`(?i)\bfrom\s+([a-zA-Z_][a-zA-Z0-9_$]*(?:\.[a-zA-Z_][a-zA-Z0-9_$]*)?)`)
+	probeNumericRe  = regexp.MustCompile(`^-?\d+(\.\d+)?$`)
+)
+
+// probeValues picks realistic probe values for the $n placeholders of a
+// parameterized query, derived from the target column's pg_stats histogram.
+// This lets EXPLAIN estimate selectivity with a representative constant
+// instead of an arbitrary dummy (e.g. for `abalance > $1` a low-end value
+// would make the predicate look unselective). Returns a map of parameter
+// number -> Go value; ok=false when no plain-column WHERE predicate is found
+// or the column has no statistics.
+func probeValues(ctx context.Context, conn *pgx.Conn, sql string) (map[int]any, bool) {
+	out := map[int]any{}
+	var colExpr, op string
+	var p1, p2 int
+	if m := probeBetweenRe.FindStringSubmatch(sql); m != nil {
+		colExpr, op = m[1], "between"
+		fmt.Sscanf(m[2], "%d", &p1)
+		fmt.Sscanf(m[3], "%d", &p2)
+	} else if m := probeWhereRe.FindStringSubmatch(sql); m != nil {
+		colExpr, op = m[1], m[2]
+		fmt.Sscanf(m[3], "%d", &p1)
+	} else {
+		return nil, false
+	}
+
+	col := colExpr
+	if i := strings.LastIndex(col, "."); i >= 0 {
+		col = col[i+1:]
+	}
+	col = strings.Trim(col, `"`)
+	fm := probeFromRe.FindStringSubmatch(sql)
+	if fm == nil {
+		return nil, false
+	}
+	tbl := fm[1]
+	schema, table := "public", tbl
+	if i := strings.Index(tbl, "."); i >= 0 {
+		schema, table = tbl[:i], tbl[i+1:]
+	}
+
+	var boundsTxt, mcvsTxt string
+	err := conn.QueryRow(ctx,
+		`SELECT COALESCE(array_to_string(histogram_bounds, '|'), ''),
+		        COALESCE(array_to_string(most_common_vals, '|'), '')
+		 FROM pg_stats WHERE schemaname = $1 AND tablename = $2 AND attname = $3`,
+		schema, table, col).Scan(&boundsTxt, &mcvsTxt)
+	if err != nil {
+		return nil, false
+	}
+	bounds := []string{}
+	for _, b := range strings.Split(boundsTxt, "|") {
+		if s := strings.TrimSpace(b); s != "" {
+			bounds = append(bounds, s)
+		}
+	}
+	if len(bounds) < 2 {
+		// no histogram (e.g. unique column): MCV is meaningless, fall back
+		return nil, false
+	}
+
+	pick := func(idx int) any {
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(bounds) {
+			idx = len(bounds) - 1
+		}
+		v := bounds[idx]
+		if probeNumericRe.MatchString(v) {
+			if strings.ContainsAny(v, ".eE") {
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					return f
+				}
+			}
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				return n
+			}
+		}
+		return v
+	}
+
+	lo, hi := 1, len(bounds)-2
+	if hi < lo {
+		hi = lo
+	}
+	switch op {
+	case "<", "<=":
+		out[p1] = pick(lo)
+	case ">", ">=":
+		out[p1] = pick(hi)
+	case "between":
+		out[p1] = pick((lo + hi) / 2)
+		out[p2] = pick(hi)
+	default: // "=", "<>", "!=": probe the median — representative, not extreme
+		out[p1] = pick((lo + hi) / 2)
+	}
+	return out, true
+}
+
 type jsonExplain struct {
 	Plan          jsonPlan `json:"Plan"`
 	PlanningTime  float64  `json:"Planning Time"`
@@ -362,13 +481,19 @@ func walkPlan(n jsonPlan, q TopQuery) []Finding {
 			if n.Schema != "" {
 				tbl = n.Schema + "." + n.RelationName
 			}
-			out = append(out, Finding{
+			f := Finding{
 				Kind:       "seq-scan",
 				QueryID:    q.QueryID,
 				Table:      tbl,
+				EstRows:    int64(n.PlanRows),
 				Detail:     fmt.Sprintf("seq scan on %s with filter %q", tbl, n.Filter),
 				Suggestion: "an index supporting this filter would let the planner use an index scan",
-			})
+			}
+			if ddl := indexDDLForFilter(tbl, n.Filter); ddl != "" {
+				f.IndexDDL = ddl
+				f.Suggestion = "an index on the filtered column would let the planner use an index scan"
+			}
+			out = append(out, f)
 		}
 	case "Sort", "Incremental Sort":
 		if n.SortSpaceType == "Disk" || strings.Contains(n.SortMethod, "external") {
@@ -411,4 +536,60 @@ func walkPlan(n jsonPlan, q TopQuery) []Finding {
 		out = append(out, walkPlan(c, q)...)
 	}
 	return out
+}
+
+// splitTable splits "schema.table" into its parts (schema defaults to public).
+func splitTable(tbl string) (schema, table string) {
+	if i := strings.LastIndex(tbl, "."); i >= 0 {
+		return tbl[:i], tbl[i+1:]
+	}
+	return "public", tbl
+}
+
+// filterColumn extracts the plain column name from a filter predicate such as
+// "(abalance < 1)" or "t.col BETWEEN 10 AND 20". Returns "" for expressions
+// (functions, casts) that would need an expression index instead.
+func filterColumn(filter string) string {
+	f := strings.TrimSpace(filter)
+	for strings.HasPrefix(f, "(") && strings.HasSuffix(f, ")") {
+		f = strings.TrimSpace(f[1 : len(f)-1])
+	}
+	re := regexp.MustCompile(`^("?[A-Za-z_][A-Za-z0-9_$]*"?)(?:\s*\.\s*("?[A-Za-z_][A-Za-z0-9_$]*"?))?\s*(=|<>|!=|<=|>=|<|>|IN|BETWEEN|LIKE|ILIKE)`)
+	m := re.FindStringSubmatch(f)
+	if m == nil {
+		return ""
+	}
+	col := m[1]
+	if m[2] != "" {
+		col = m[2]
+	}
+	return strings.Trim(col, `"`)
+}
+
+// indexDDLForFilter builds a CREATE INDEX statement for the column a filter
+// predicate targets, or "" if no plain column can be extracted.
+func indexDDLForFilter(tbl, filter string) string {
+	schema, table := splitTable(tbl)
+	col := filterColumn(filter)
+	if table == "" || col == "" {
+		return ""
+	}
+	return fmt.Sprintf("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_%s_%s ON %s.%s (%s);",
+		table, col, schema, table, col)
+}
+
+// indexSelectivity reports the planner's estimated rows matching the filter
+// versus live rows in the table (from pg_stat_user_tables).
+func indexSelectivity(f *Finding, tables []TableStat) (est, total float64, ok bool) {
+	schema, table := splitTable(f.Table)
+	for _, t := range tables {
+		ts, tt := splitTable(t.Table)
+		if ts == schema && tt == table {
+			if t.Live <= 0 || f.EstRows < 0 {
+				return 0, 0, false
+			}
+			return float64(f.EstRows), float64(t.Live), true
+		}
+	}
+	return 0, 0, false
 }

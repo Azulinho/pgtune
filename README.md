@@ -33,12 +33,21 @@ make load           # generate workload, then re-run pgtune to see analysis
 3. **Query analysis** (`pg_stat_statements`, auto-installed if missing)
    - Top queries by total execution time, with call counts and mean latency.
    - `EXPLAIN (ANALYZE, BUFFERS)` on the most expensive SELECTs — real
-     execution. Parameterized queries get `EXPLAIN (GENERIC_PLAN)` (plan shape
-     without executing; pgss normalizes literals to `$n`, so ANALYZE can only
-     run on constant-free queries). DML is never executed.
-   - Findings: seq scans with filters (→ index), sorts spilling to disk /
-     temp spills (→ work_mem), planner estimate skew (→ ANALYZE), table bloat,
-     stale statistics, checkpoint pressure, long-running queries.
+     execution. Parameterized queries get a plain `EXPLAIN` (no execution)
+     with probe values derived from `pg_stats` histograms, so the planner
+     estimates selectivity realistically (pgss normalizes literals to `$n`;
+     GENERIC_PLAN would assume ~1/3 selectivity for every predicate). DML is
+     never executed.
+   - Findings: seq scans with filters (→ **concrete CREATE INDEX
+     recommendation**), sorts spilling to disk / temp spills (→ work_mem),
+     planner estimate skew (→ ANALYZE), table bloat, stale statistics,
+     checkpoint pressure, long-running queries.
+   - Index recommendations: for a filtered seq scan on a plain column, the app
+     emits `CREATE INDEX CONCURRENTLY` DDL, estimates selectivity with the
+     histogram probe (skips predicates matching >10% of the table), skips
+     columns already covered by an index, warns when the table is write-heavy,
+     and with `-apply-index` creates the index and re-runs EXPLAIN to verify
+     the planner switched to it.
 
 4. **Compute the plan** — classic pgtune-style formulas per workload
    (`oltp` default, `olap`, `mixed`, `desktop`) **plus evidence-based
@@ -75,6 +84,8 @@ pgtune [flags]
   -db string            database to analyze (default "app")
   -workload string      oltp | olap | mixed | desktop (default "oltp")
   -apply                apply the plan (ALTER SYSTEM + reload)
+  -apply-index          create indexes recommended by seq-scan findings
+                        (CONCURRENTLY; skips unselective & covered cases; verifies)
   -restart              restart postgres via sudo systemctl if required
   -analyze              run ANALYZE when stale statistics are detected (apply mode)
   -sudo                 allow sudo -u postgres fallback for apply (default true)
@@ -89,6 +100,7 @@ Examples:
 
 ```bash
 ./pgtune -workload olap -apply -restart -analyze   # full analytics auto-tune
+./pgtune -apply-index                             # create recommended indexes
 ./pgtune -port 5432 -apply                         # connect direct to postgres
 ./pgtune -sudo=false                               # print SQL instead of applying
 ./pgtune -explain 0                                # skip EXPLAIN (faster, read-only)

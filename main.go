@@ -29,6 +29,7 @@ type Options struct {
 	TablesN        int
 	InstallPgss    bool
 	Analyze        bool
+	ApplyIndex     bool
 }
 
 func main() {
@@ -48,6 +49,7 @@ func main() {
 	flag.IntVar(&opts.TablesN, "tables", 10, "number of largest tables to analyze")
 	flag.BoolVar(&opts.InstallPgss, "install-pgss", true, "Install pg_stat_statements (extension + preload) when missing")
 	flag.BoolVar(&opts.Analyze, "analyze", false, "Run ANALYZE when stale statistics are detected (apply mode)")
+	flag.BoolVar(&opts.ApplyIndex, "apply-index", false, "Create indexes recommended by seq-scan findings (CONCURRENTLY, skips unselective ones)")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -123,6 +125,13 @@ func main() {
 		fmt.Println("\nRun with -apply to apply these changes (ALTER SYSTEM + reload).")
 		if qa != nil && qa.RestartNeeded {
 			fmt.Println("note: pg_stat_statements needs -apply -restart once to start capturing query stats.")
+		}
+	}
+
+	if opts.ApplyIndex {
+		if err := applyIndexes(ctx, conn, opts, qa); err != nil {
+			fmt.Fprintf(os.Stderr, "error: index: %v\n", err)
+			os.Exit(1)
 		}
 	}
 }
