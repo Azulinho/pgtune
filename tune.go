@@ -18,9 +18,10 @@ const (
 )
 
 const (
+	KiB = uint64(1 << 10)
 	MiB = uint64(1 << 20)
 	GiB = uint64(1 << 30)
-	KiB = uint64(1 << 10)
+	TiB = uint64(1 << 40)
 )
 
 func parseWorkload(s string) (Workload, error) {
@@ -60,6 +61,10 @@ const (
 
 func fmtBytes(b uint64) string {
 	switch {
+	case b >= TiB && b%TiB == 0:
+		return fmt.Sprintf("%dTB", b/TiB)
+	case b >= TiB:
+		return fmt.Sprintf("%.1fTB", float64(b)/float64(TiB))
 	case b >= GiB && b%GiB == 0:
 		return fmt.Sprintf("%dGB", b/GiB)
 	case b >= GiB:
@@ -262,6 +267,12 @@ func buildPlan(sys *SysStats, db *DBStats, wl Workload, qa *QueryAnalysis) []Pla
 				shared = ns
 				notes["shared_buffers"] = fmt.Sprintf("cache hit ratio only %.1f%%", hit*100)
 			}
+		} else if hit > 0 && hit < 0.98 {
+			// raise was considered but is pointless: the database cannot fit
+			// in RAM no matter how big the cache is
+			notes["shared_buffers"] = fmt.Sprintf(
+				"cache hit ratio only %.1f%% but database (%s) exceeds RAM (%s) - a bigger cache cannot help",
+				hit*100, fmtBytes(uint64(db.DatabaseSizeBytes)), fmtBytes(ram))
 		}
 
 		// 3. checkpoint pressure (requested >= timed) -> WAL too small.

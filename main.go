@@ -1,4 +1,4 @@
-// pgtune — connect to PostgreSQL, gather stats, compute a tuning plan,
+// pgtune - connect to PostgreSQL, gather stats, compute a tuning plan,
 // and apply it to the server configuration (ALTER SYSTEM + reload).
 package main
 
@@ -82,7 +82,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	qa, err := collectQueryAnalysis(ctx, conn, opts)
+	qa, err := collectQueryAnalysis(ctx, conn, opts, db)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: query analysis: %v\n", err)
 		os.Exit(1)

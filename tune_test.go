@@ -4,6 +4,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---- helpers ---------------------------------------------------------------
@@ -92,6 +93,8 @@ func TestFmtBytes(t *testing.T) {
 		{GiB, "1GB"},
 		{int64ToUint(3.2 * float64(GiB)), "3.2GB"},
 		{6 * GiB, "6GB"},
+		{TiB, "1TB"},
+		{int64ToUint(5.6 * float64(TiB)), "5.6TB"},
 	}
 	for _, c := range cases {
 		if got := fmtBytes(c.in); got != c.want {
@@ -343,7 +346,74 @@ func TestBuildPlanGoodCacheKeepsSharedBuffers(t *testing.T) {
 	}
 }
 
+// A DB bigger than RAM with a low cache hit ratio must NOT raise
+// shared_buffers, and the plan must explain why (even though unchanged).
+func TestBuildPlanSkipsRaiseWhenDBExceedsRAM(t *testing.T) {
+	sys := &SysStats{TotalMemBytes: 32 * GiB, NumCPU: 16, DiskType: "ssd"}
+	db := mkDB(mkSetting("shared_buffers", "8388608", "kB", "postmaster")) // 8GB
+	db.BlksHit = 3450
+	db.BlksRead = 6550 // 34.5% hit
+	db.DatabaseSizeBytes = int64(242 * GiB)
+	qa := &QueryAnalysis{}
+	plan := buildPlan(sys, db, WorkloadOLTP, qa)
+
+	it := planItem(t, plan, "shared_buffers")
+	if it.Changed {
+		t.Error("shared_buffers must stay unchanged when the DB exceeds RAM")
+	}
+	if !strings.Contains(it.Reason, "exceeds RAM") {
+		t.Errorf("shared_buffers reason %q should explain the skipped raise", it.Reason)
+	}
+}
+
 // ---- countFinding ----------------------------------------------------------
+
+func TestIsStaleAnalyze(t *testing.T) {
+	now := time.Now()
+	recent := now.Add(-6 * time.Hour)
+	old := now.Add(-8 * 24 * time.Hour)
+	cut := 7 * 24 * time.Hour
+
+	// auto-analyzed 6h ago, never manually: NOT stale (the reported bug:
+	// the old logic flagged any table whose manual last_analyze was nil)
+	if isStaleAnalyze(nil, &recent, now, cut) {
+		t.Error("auto-analyzed 6h ago must not be stale, even without a manual ANALYZE")
+	}
+	// never analyzed at all: stale
+	if !isStaleAnalyze(nil, nil, now, cut) {
+		t.Error("never-analyzed table must be stale")
+	}
+	// both recent: not stale
+	if isStaleAnalyze(&recent, &recent, now, cut) {
+		t.Error("both recent must not be stale")
+	}
+	// both old: stale
+	if !isStaleAnalyze(&old, &old, now, cut) {
+		t.Error("both old must be stale")
+	}
+	// most recent of the two wins in either direction
+	if isStaleAnalyze(&recent, &old, now, cut) {
+		t.Error("recent manual ANALYZE must win over an old auto one")
+	}
+	if isStaleAnalyze(&old, &recent, now, cut) {
+		t.Error("recent auto ANALYZE must win over an old manual one")
+	}
+}
+
+func TestSelfQueryPatterns(t *testing.T) {
+	p := selfQueryPatterns()
+	for _, want := range []string{"EXPLAIN%", "%pg_stat_statements%", "%pg_available_extensions%", "%pg_stat_user_tables%"} {
+		found := false
+		for _, pat := range p {
+			if pat == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("selfQueryPatterns missing %q", want)
+		}
+	}
+}
 
 func TestCountFinding(t *testing.T) {
 	if got := countFinding(nil, "bloat"); got != 0 {

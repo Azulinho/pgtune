@@ -75,6 +75,41 @@ type QueryAnalysis struct {
 
 var dmlRe = regexp.MustCompile(`(?i)^\s*(insert|update|delete|merge|create|alter|drop|truncate|grant|revoke|copy|vacuum|analyze|call|do|reindex|cluster|refresh)\b`)
 
+// isStaleAnalyze reports whether a table's statistics are stale: the most
+// recent ANALYZE (manual or auto) is older than the cutoff, or the table was
+// never analyzed at all. A table that was only ever auto-analyzed is NOT stale
+// as long as that run is recent.
+func isStaleAnalyze(lastA, lastAA *time.Time, now time.Time, cutoff time.Duration) bool {
+	last := lastA
+	if last == nil || (lastAA != nil && lastAA.After(*last)) {
+		last = lastAA
+	}
+	if last == nil {
+		return true // never analyzed in any way
+	}
+	return last.Before(now.Add(-cutoff))
+}
+
+// selfQueryPatterns are ILIKE patterns identifying the app's own diagnostic
+// statements so they do not pollute the pg_stat_statements top list.
+func selfQueryPatterns() []string {
+	return []string{
+		"EXPLAIN%",
+		"%pg_available_extensions%",
+		"%pg_stat_statements%",
+		"%pg_stat_user_tables%",
+		"%pg_stat_activity%",
+		"%pg_stat_database%",
+		"%pg_stat_checkpointer%",
+		"%pg_stat_bgwriter%",
+		"%pg_extension%",
+		"%pg_settings%",
+		"%pg_type WHERE typname%", // pgx driver type resolution on connect
+		"SET %",                   // framework per-connection setup, not workload
+		"%set_config(%",
+	}
+}
+
 func checkPgss(ctx context.Context, conn *pgx.Conn) (available, installed, preloaded bool, err error) {
 	var n int
 	if err := conn.QueryRow(ctx,
@@ -94,7 +129,7 @@ func checkPgss(ctx context.Context, conn *pgx.Conn) (available, installed, prelo
 	return available, installed, preloaded, nil
 }
 
-func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options) (*QueryAnalysis, error) {
+func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options, db *DBStats) (*QueryAnalysis, error) {
 	qa := &QueryAnalysis{}
 
 	avail, installed, preloaded, err := checkPgss(ctx, conn)
@@ -104,15 +139,15 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options) (*Q
 	qa.Available, qa.Installed, qa.Preloaded = avail, installed, preloaded
 
 	if !avail {
-		qa.Note = "pg_stat_statements is not available on this server (postgresql-contrib missing) — query analysis skipped"
+		qa.Note = "pg_stat_statements is not available on this server (postgresql-contrib missing) - query analysis skipped"
 		return qa, nil
 	}
 	if !preloaded {
 		qa.RestartNeeded = true
 		if installed {
-			qa.Note = "pg_stat_statements is installed but not in shared_preload_libraries — it captures stats only after a restart"
+			qa.Note = "pg_stat_statements is installed but not in shared_preload_libraries - it captures stats only after a restart"
 		} else {
-			qa.Note = "pg_stat_statements is not installed and not preloaded — run with -apply to install it (one restart required)"
+			qa.Note = "pg_stat_statements is not installed and not preloaded - run with -apply to install it (one restart required)"
 		}
 		return qa, nil
 	}
@@ -122,10 +157,10 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options) (*Q
 		FROM pg_stat_statements s
 		JOIN pg_database d ON d.oid = s.dbid
 		WHERE d.datname = current_database()
-		  AND s.query NOT ILIKE 'EXPLAIN%'
 		  AND s.query <> '<insufficient privilege>'
+		  AND NOT (s.query ILIKE ANY($2))
 		ORDER BY s.total_exec_time DESC
-		LIMIT $1`, opts.TopN)
+		LIMIT $1`, opts.TopN, selfQueryPatterns())
 	if err != nil {
 		qa.Note = "could not read pg_stat_statements: " + err.Error()
 		return qa, nil
@@ -144,7 +179,7 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options) (*Q
 		return nil, err
 	}
 	if len(qa.Top) == 0 {
-		qa.Note = "no statements captured in pg_stat_statements yet — run a workload (make load) and re-run"
+		qa.Note = "no statements captured in pg_stat_statements yet - run a workload (make load) and re-run"
 	}
 
 	// long-running queries
@@ -214,7 +249,7 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options) (*Q
 			qa.Findings = append(qa.Findings, Finding{
 				Kind:  "table-seq-scan",
 				Table: t.Schema + "." + t.Table,
-				Detail: fmt.Sprintf("%s.%s: %d sequential scans vs %d index scans — reads are walking the whole table",
+				Detail: fmt.Sprintf("%s.%s: %d sequential scans vs %d index scans - reads are walking the whole table",
 					t.Schema, t.Table, t.SeqScan, t.IdxScan),
 				Suggestion: "an index on the columns used by common WHERE filters would cut I/O dramatically",
 			})
@@ -223,25 +258,32 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options) (*Q
 			qa.Findings = append(qa.Findings, Finding{
 				Kind:  "bloat",
 				Table: t.Schema + "." + t.Table,
-				Detail: fmt.Sprintf("%s.%s: %.1f%% dead tuples — table is bloating",
+				Detail: fmt.Sprintf("%s.%s: %.1f%% dead tuples - table is bloating",
 					t.Schema, t.Table, t.DeadPct*100),
 				Suggestion: "check autovacuum (more workers / lower scale factor) or run VACUUM",
 			})
 		}
-		stale := t.LastAnalyze == nil || t.LastAutoAnalyze == nil
-		if !stale {
-			cut := time.Now().Add(-7 * 24 * time.Hour)
-			stale = t.LastAnalyze.Before(cut) && t.LastAutoAnalyze.Before(cut)
-		}
+		stale := isStaleAnalyze(t.LastAnalyze, t.LastAutoAnalyze, time.Now(), 7*24*time.Hour)
 		if stale && t.SizeBytes > int64(8*MiB) {
 			qa.Findings = append(qa.Findings, Finding{
 				Kind:  "stale-stats",
 				Table: t.Schema + "." + t.Table,
-				Detail: fmt.Sprintf("%s.%s: no ANALYZE in 7+ days — planner is guessing row counts",
+				Detail: fmt.Sprintf("%s.%s: no ANALYZE in the last 7 days - planner is guessing row counts",
 					t.Schema, t.Table),
 				Suggestion: "run ANALYZE (the app can do it with -analyze)",
 			})
 		}
+	}
+
+	// aggregate temp-file pressure that per-query EXPLAINs cannot see (the
+	// top queries are parameterized and only get a non-executing EXPLAIN).
+	// Cumulative since the last stats reset - advisory, not per-sort evidence.
+	if db != nil && db.TempBytes > int64(10*GiB) {
+		qa.Findings = append(qa.Findings, Finding{
+			Kind:       "temp-spill-db",
+			Detail:     fmt.Sprintf("%d temp file(s), %s total spilled to disk since stats reset", db.TempFiles, fmtBytes(uint64(db.TempBytes))),
+			Suggestion: "sorts exceed work_mem; add covering indexes on ORDER BY/filter columns, or raise maintenance_work_mem for index builds",
+		})
 	}
 
 	// EXPLAIN ANALYZE / GENERIC_PLAN on the most expensive eligible queries.
@@ -440,7 +482,7 @@ func probeValues(ctx context.Context, conn *pgx.Conn, sql string) (map[int]any, 
 	case "between":
 		out[p1] = pick((lo + hi) / 2)
 		out[p2] = pick(hi)
-	default: // "=", "<>", "!=": probe the median — representative, not extreme
+	default: // "=", "<>", "!=": probe the median - representative, not extreme
 		out[p1] = pick((lo + hi) / 2)
 	}
 	return out, true
@@ -528,7 +570,7 @@ func walkPlan(n jsonPlan, q TopQuery) []Finding {
 				Kind:       "estimate-skew",
 				QueryID:    q.QueryID,
 				Detail:     fmt.Sprintf("planner estimated %.0f rows, actual %.0f (%.0fx off)", n.PlanRows, n.ActualRows, off),
-				Suggestion: "statistics are stale or missing — run ANALYZE",
+				Suggestion: "statistics are stale or missing - run ANALYZE",
 			})
 		}
 	}

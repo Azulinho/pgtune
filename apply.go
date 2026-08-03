@@ -45,7 +45,7 @@ func applyIndexes(ctx context.Context, conn *pgx.Conn, opts Options, qa *QueryAn
 		}
 		seen[f.IndexDDL] = true
 		if est, total, ok := indexSelectivity(f, qa.Tables); ok && total > 0 && est/total > 0.10 {
-			fmt.Printf("skip index on %s: filter matches %.1f%% of the table — not selective enough\n", f.Table, est/total*100)
+			fmt.Printf("skip index on %s: filter matches %.1f%% of the table - not selective enough\n", f.Table, est/total*100)
 			continue
 		}
 		toCreate = append(toCreate, f)
@@ -61,11 +61,11 @@ func applyIndexes(ctx context.Context, conn *pgx.Conn, opts Options, qa *QueryAn
 			continue
 		}
 		if name, ok := coveringIndex(ctx, conn, schema, table, col); ok {
-			fmt.Printf("index on %s.%s (%s) already covered by %s — skipping\n", schema, table, col, name)
+			fmt.Printf("index on %s.%s (%s) already covered by %s - skipping\n", schema, table, col, name)
 			continue
 		}
 		if writeHeavy := tableWriteHeavy(f, qa.Tables); writeHeavy {
-			fmt.Printf("warning: %s.%s is write-heavy — the new index adds per-row UPDATE/DELETE overhead\n", schema, table)
+			fmt.Printf("warning: %s.%s is write-heavy - the new index adds per-row UPDATE/DELETE overhead\n", schema, table)
 		}
 		if !opts.UseSudo {
 			fmt.Printf("apply with -sudo (or run manually): %s\n", f.IndexDDL)
@@ -236,7 +236,7 @@ func applySettings(ctx context.Context, conn *pgx.Conn, db *DBStats, plan []Plan
 		}
 	}
 	if len(changed) == 0 {
-		fmt.Println("No configuration changes needed — the instance already matches the plan.")
+		fmt.Println("No configuration changes needed - the instance already matches the plan.")
 		return nil, nil
 	}
 
@@ -292,7 +292,7 @@ func applyPgss(ctx context.Context, conn *pgx.Conn, opts Options, dbName string)
 		return nil, err
 	}
 	if !avail {
-		fmt.Println("pg_stat_statements not available on this server (postgresql-contrib missing) — skipping.")
+		fmt.Println("pg_stat_statements not available on this server (postgresql-contrib missing) - skipping.")
 		return nil, nil
 	}
 
@@ -341,7 +341,7 @@ func applyAnalyze(ctx context.Context, opts Options, db *DBStats, qa *QueryAnaly
 	}
 	need := countFinding(qa, "stale-stats") > 0 || countFinding(qa, "estimate-skew") > 0
 	if !need {
-		fmt.Println("No stale statistics detected — skipping ANALYZE.")
+		fmt.Println("No stale statistics detected - skipping ANALYZE.")
 		return nil
 	}
 	fmt.Printf("Running ANALYZE on database %s (stale statistics detected)...\n", db.Database)

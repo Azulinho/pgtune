@@ -79,10 +79,12 @@ func printReport(sys *SysStats, db *DBStats, wl Workload, plan []PlanItem, qa *Q
 	}
 	w.Flush()
 
-	// evidence-based adjustments get called out under the table
+	// evidence-based adjustments get called out under the table (also when the
+	// item was NOT changed, so an "ok" row can explain itself, e.g. a low
+	// cache hit ratio that cannot be fixed because the DB exceeds RAM)
 	printed := false
 	for _, it := range plan {
-		if it.Changed && strings.Contains(it.Reason, "evidence") {
+		if strings.Contains(it.Reason, "evidence") {
 			if !printed {
 				fmt.Fprintln(w, "\nEvidence-based adjustments:")
 				printed = true
@@ -168,18 +170,18 @@ func printQueryAnalysis(w *tabwriter.Writer, qa *QueryAnalysis) {
 			where := ""
 			if f.QueryID != 0 {
 				where = fmt.Sprintf(" [query #%d]", f.QueryID)
-			} else if f.Table != "" {
+			} else if f.Table != "" && !strings.Contains(f.Detail, f.Table) {
 				where = " [" + f.Table + "]"
 			}
-			fmt.Fprintf(w, "  ! %s%s — %s\n", f.Detail, where, f.Suggestion)
+			fmt.Fprintf(w, "  ! %s%s - %s\n", f.Detail, where, f.Suggestion)
 			if f.IndexDDL != "" {
 				if est, total, ok := indexSelectivity(&f, qa.Tables); ok {
 					pct := est / total * 100
 					if pct <= 10 {
 						fmt.Fprintf(w, "      index: %s\n", f.IndexDDL)
-						fmt.Fprintf(w, "      matches ~%.0f of %.0f rows (%.3f%% of table) — create it with -apply-index\n", est, total, pct)
+						fmt.Fprintf(w, "      matches ~%.0f of %.0f rows (%.3f%% of table) - create it with -apply-index\n", est, total, pct)
 					} else {
-						fmt.Fprintf(w, "      matches ~%.0f of %.0f rows (%.1f%% of table) — low selectivity, index may not help\n", est, total, pct)
+						fmt.Fprintf(w, "      matches ~%.0f of %.0f rows (%.1f%% of table) - low selectivity, index may not help\n", est, total, pct)
 					}
 				} else {
 					fmt.Fprintf(w, "      index: %s\n", f.IndexDDL)

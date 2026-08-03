@@ -40,8 +40,11 @@ make load           # generate workload, then re-run pgtune to see analysis
      never executed.
    - Findings: seq scans with filters (→ **concrete CREATE INDEX
      recommendation**), sorts spilling to disk / temp spills (→ work_mem),
-     planner estimate skew (→ ANALYZE), table bloat, stale statistics,
-     checkpoint pressure, long-running queries.
+     planner estimate skew (→ ANALYZE), table bloat, stale statistics
+     (manual or auto ANALYZE older than 7 days), aggregate temp-file pressure
+     (e.g. 113GB spilled since stats reset), checkpoint pressure,
+     long-running queries. The app's own diagnostic queries and driver/framework
+     setup statements are excluded from the pg_stat_statements top list.
    - Index recommendations: for a filtered seq scan on a plain column, the app
      emits `CREATE INDEX CONCURRENTLY` DDL, estimates selectivity with the
      histogram probe (skips predicates matching >10% of the table), skips
