@@ -97,6 +97,8 @@ pgtune [flags]
   -explain int          how many top queries to EXPLAIN, 0 disables (default 3)
   -long-running float   flag queries running longer than this many seconds (default 5)
   -tables int           number of largest tables to analyze (default 10)
+  -all-dbs              analyze every database on the server, one instance
+                        plan + per-database recommendations
 ```
 
 Examples:
@@ -107,7 +109,47 @@ Examples:
 ./pgtune -port 5432 -apply                         # connect direct to postgres
 ./pgtune -sudo=false                               # print SQL instead of applying
 ./pgtune -explain 0                                # skip EXPLAIN (faster, read-only)
+./pgtune -all-dbs                                  # every database on the server
 ```
+
+## Multiple databases on one server
+
+Tuning parameters (`shared_buffers`, `work_mem`, WAL, autovacuum, ...) are
+**instance-wide**: the plan is computed once, with evidence (disk sorts, temp
+spills, cache hit ratio, bloat) aggregated across all databases. Query analysis
+is **per-database** (table stats, pg_stat_statements, EXPLAIN, and index
+recommendations are inherently per-database), so each database gets its own
+section with its own findings - a converged OLTP database may show "no
+problems" while a second database recommends a new index.
+
+```bash
+./pgtune -all-dbs          # analysis only
+./pgtune -all-dbs -apply   # instance plan + install pg_stat_statements in every DB
+./pgtune -all-dbs -analyze -apply-index   # per-database ANALYZE + index creation
+```
+
+### Permissions
+
+Since PostgreSQL 15, a non-superuser can only see their *own* statements in
+`pg_stat_statements` and their own tables' `pg_stats` histograms, so a plain
+`app` user gets an incomplete picture of other databases. For the full
+cross-database view, run as a role with `pg_read_all_stats` (plus table
+privileges so EXPLAIN can plan the queries):
+
+```sql
+CREATE ROLE pgtune LOGIN PASSWORD 'pgtune';
+GRANT pg_read_all_stats TO pgtune;
+-- optionally, per database:  GRANT SELECT ON ALL TABLES IN SCHEMA public TO pgtune;
+```
+
+```bash
+make tune-all PGPORT=5432 PGUSER=pgtune PGPASSWORD=pgtune   # = ./pgtune -all-dbs ...
+```
+
+Databases you cannot connect to are listed as skipped. The maintenance
+`postgres` database is analyzed like any other; the `pg_stat_statements`
+extension must be installed in each database you want captured (the app does
+this automatically with `-apply`).
 
 ## Load testing
 
@@ -133,6 +175,7 @@ make load DURATION=30          # after
 | `main.go` | CLI entry, orchestration |
 | `stats.go` | system + live PostgreSQL statistics collection |
 | `queries.go` | pg_stat_statements, long-running queries, EXPLAIN analysis, findings |
+| `alldbs.go` | multi-database discovery, per-DB collection, instance aggregation |
 | `tune.go` | tuning formulas + evidence-based adjustments |
 | `apply.go` | ALTER SYSTEM / reload / pg_stat_statements install / ANALYZE / restart |
 | `report.go` | terminal report rendering |

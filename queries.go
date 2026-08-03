@@ -95,8 +95,10 @@ func isStaleAnalyze(lastA, lastAA *time.Time, now time.Time, cutoff time.Duratio
 func selfQueryPatterns() []string {
 	return []string{
 		"EXPLAIN%",
+		"ALTER SYSTEM%",
 		"%pg_available_extensions%",
 		"%pg_stat_statements%",
+		"%pg_stat_statements_reset%",
 		"%pg_stat_user_tables%",
 		"%pg_stat_activity%",
 		"%pg_stat_database%",
@@ -104,6 +106,11 @@ func selfQueryPatterns() []string {
 		"%pg_stat_bgwriter%",
 		"%pg_extension%",
 		"%pg_settings%",
+		"%pg_database_size%",
+		"%pg_postmaster_start_time%",
+		"%pg_roles%",
+		"%pg_reload_conf%",
+		"%pg_stats%",
 		"%pg_type WHERE typname%", // pgx driver type resolution on connect
 		"SET %",                   // framework per-connection setup, not workload
 		"%set_config(%",
@@ -326,7 +333,8 @@ func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, e
 			for i := range args {
 				args[i] = 1
 			}
-			if probe, ok := probeValues(ctx, conn, sql); ok {
+			probe, probed := probeValues(ctx, conn, sql)
+			if probed {
 				for k, v := range probe {
 					if k >= 1 && k <= len(args) {
 						args[k-1] = v
@@ -334,6 +342,19 @@ func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, e
 				}
 			}
 			if err := conn.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+sql, args...).Scan(&out); err != nil {
+				// when the probe succeeded the failure is real (e.g. permission
+				// denied); when we shot blind with dummy 1 it is usually just a
+				// type mismatch of the placeholder, which says nothing about the
+				// query itself - stay quiet in that case
+				if probed {
+					qa.Findings = append(qa.Findings, Finding{
+						Kind:       "explain-error",
+						QueryID:    q.QueryID,
+						Detail:     fmt.Sprintf("EXPLAIN failed: %v", err),
+						Suggestion: "query may be slow or not executable in this session",
+					})
+					done++
+				}
 				continue
 			}
 		} else {

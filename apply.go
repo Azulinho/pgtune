@@ -32,7 +32,7 @@ func sudoPSQL(ctx context.Context, db string, stmts ...string) error {
 // selective predicates are applied (filter matches <= 10% of the table);
 // existing covering indexes are skipped. After creation it ANALYZEs the table
 // and re-runs EXPLAIN to verify the planner actually switched to the index.
-func applyIndexes(ctx context.Context, conn *pgx.Conn, opts Options, qa *QueryAnalysis) error {
+func applyIndexes(ctx context.Context, conn *pgx.Conn, opts Options, dbName string, qa *QueryAnalysis) error {
 	if qa == nil {
 		return nil
 	}
@@ -71,12 +71,12 @@ func applyIndexes(ctx context.Context, conn *pgx.Conn, opts Options, qa *QueryAn
 			fmt.Printf("apply with -sudo (or run manually): %s\n", f.IndexDDL)
 			continue
 		}
-		if err := sudoPSQL(ctx, opts.DB, f.IndexDDL); err != nil {
+		if err := sudoPSQL(ctx, dbName, f.IndexDDL); err != nil {
 			return fmt.Errorf("create index: %w", err)
 		}
 		fmt.Printf("created index on %s.%s (%s)\n", schema, table, col)
 		// refresh planner statistics so the new path is considered accurately
-		if err := sudoPSQL(ctx, opts.DB, fmt.Sprintf("ANALYZE %s.%s;", schema, table)); err != nil {
+		if err := sudoPSQL(ctx, dbName, fmt.Sprintf("ANALYZE %s.%s;", schema, table)); err != nil {
 			fmt.Printf("warning: ANALYZE %s.%s failed: %v\n", schema, table, err)
 		}
 		if q := topQueryByID(qa, f.QueryID); q != nil {
@@ -305,6 +305,9 @@ func applyPgss(ctx context.Context, conn *pgx.Conn, opts Options, dbName string)
 	if !preloaded {
 		// The current shared_preload_libraries value is only readable as a
 		// superuser, so fetch it through sudo and merge pg_stat_statements in.
+		// preloaded (from view existence) is false whenever the extension is
+		// missing from THIS database, even if the library is already preloaded
+		// server-wide - so only a genuine preload change needs a restart.
 		cur, err := sudoShow(ctx, "SHOW shared_preload_libraries")
 		if err != nil {
 			return nil, err
@@ -319,8 +322,8 @@ func applyPgss(ctx context.Context, conn *pgx.Conn, opts Options, dbName string)
 			parts = append(parts, "pg_stat_statements")
 			stmts = append(stmts, fmt.Sprintf(
 				"ALTER SYSTEM SET shared_preload_libraries = '%s';", strings.Join(parts, ", ")))
+			restart = append(restart, "shared_preload_libraries (pg_stat_statements)")
 		}
-		restart = append(restart, "shared_preload_libraries (pg_stat_statements)")
 	}
 
 	if len(stmts) == 0 {
@@ -335,17 +338,19 @@ func applyPgss(ctx context.Context, conn *pgx.Conn, opts Options, dbName string)
 }
 
 // applyAnalyze runs ANALYZE when stale statistics were detected.
-func applyAnalyze(ctx context.Context, opts Options, db *DBStats, qa *QueryAnalysis) error {
+func applyAnalyze(ctx context.Context, opts Options, dbName string, qa *QueryAnalysis) error {
 	if qa == nil {
 		return nil
 	}
 	need := countFinding(qa, "stale-stats") > 0 || countFinding(qa, "estimate-skew") > 0
 	if !need {
-		fmt.Println("No stale statistics detected - skipping ANALYZE.")
+		if !opts.AllDBs {
+			fmt.Println("No stale statistics detected - skipping ANALYZE.")
+		}
 		return nil
 	}
-	fmt.Printf("Running ANALYZE on database %s (stale statistics detected)...\n", db.Database)
-	return sudoPSQL(ctx, db.Database, "ANALYZE;")
+	fmt.Printf("Running ANALYZE on database %s (stale statistics detected)...\n", dbName)
+	return sudoPSQL(ctx, dbName, "ANALYZE;")
 }
 
 // sudoShow runs a single statement as the postgres superuser and returns the

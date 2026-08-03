@@ -30,6 +30,7 @@ type Options struct {
 	InstallPgss    bool
 	Analyze        bool
 	ApplyIndex     bool
+	AllDBs         bool
 }
 
 func main() {
@@ -50,6 +51,7 @@ func main() {
 	flag.BoolVar(&opts.InstallPgss, "install-pgss", true, "Install pg_stat_statements (extension + preload) when missing")
 	flag.BoolVar(&opts.Analyze, "analyze", false, "Run ANALYZE when stale statistics are detected (apply mode)")
 	flag.BoolVar(&opts.ApplyIndex, "apply-index", false, "Create indexes recommended by seq-scan findings (CONCURRENTLY, skips unselective ones)")
+	flag.BoolVar(&opts.AllDBs, "all-dbs", false, "Analyze every database on the server (per-database recommendations)")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -88,6 +90,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if opts.AllDBs {
+		runAllDBs(ctx, conn, opts, sys, db, qa)
+		return
+	}
+
 	plan := buildPlan(sys, db, wl, qa)
 	printReport(sys, db, wl, plan, qa)
 
@@ -111,7 +118,7 @@ func main() {
 		}
 
 		if opts.Analyze {
-			if err := applyAnalyze(ctx, opts, db, qa); err != nil {
+			if err := applyAnalyze(ctx, opts, db.Database, qa); err != nil {
 				fmt.Fprintf(os.Stderr, "error: analyze: %v\n", err)
 				os.Exit(1)
 			}
@@ -129,9 +136,114 @@ func main() {
 	}
 
 	if opts.ApplyIndex {
-		if err := applyIndexes(ctx, conn, opts, qa); err != nil {
+		if err := applyIndexes(ctx, conn, opts, opts.DB, qa); err != nil {
 			fmt.Fprintf(os.Stderr, "error: index: %v\n", err)
 			os.Exit(1)
 		}
 	}
+}
+
+// runAllDBs analyzes every database on the server, prints one instance-level
+// plan (evidence aggregated across databases) and per-database deep dives, and
+// applies changes: settings are instance-wide, ANALYZE and index creation run
+// against each database that needs them.
+func runAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, sys *SysStats, primaryDB *DBStats, primaryQA *QueryAnalysis) {
+	wl, err := parseWorkload(opts.Workload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	perDBs := collectAllDBs(ctx, conn, opts, primaryDB, primaryQA)
+	agg := aggregateDBStats(perDBs)
+	aggQA := aggregateQA(perDBs)
+	plan := buildPlan(sys, agg, wl, aggQA)
+	printAllReport(sys, agg, wl, plan, perDBs)
+
+	// per-database connections for apply steps (the primary connection is
+	// reused only for the instance-wide settings)
+	connectDB := func(name string) (*pgx.Conn, bool) {
+		c, err := pgx.Connect(ctx, dsnFor(opts, name))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: cannot connect to %s for apply: %v\n", name, err)
+			return nil, false
+		}
+		return c, true
+	}
+
+	if opts.Apply {
+		reasons, err := applySettings(ctx, conn, agg, plan, opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: apply: %v\n", err)
+			os.Exit(1)
+		}
+
+		if opts.InstallPgss {
+			for _, p := range perDBs {
+				if p.SkipReason != "" || p.DB == nil {
+					continue
+				}
+				c, ok := connectDB(p.DB.Database)
+				if !ok {
+					continue
+				}
+				r, err := applyPgss(ctx, c, opts, p.DB.Database)
+				c.Close(ctx)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "warning: pg_stat_statements on %s: %v\n", p.DB.Database, err)
+					continue
+				}
+				reasons = append(reasons, r...)
+			}
+		}
+
+		if opts.Analyze {
+			for _, p := range perDBs {
+				if p.SkipReason != "" || p.DB == nil {
+					continue
+				}
+				if err := applyAnalyze(ctx, opts, p.DB.Database, p.QA); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: ANALYZE on %s: %v\n", p.DB.Database, err)
+				}
+			}
+		}
+
+		if err := doRestart(ctx, opts, dedupe(reasons)); err != nil {
+			fmt.Fprintf(os.Stderr, "error: restart: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		fmt.Println("\nRun with -apply to apply the instance plan (ALTER SYSTEM + reload); -analyze / -apply-index apply per database.")
+		if aggQA != nil && aggQA.RestartNeeded {
+			fmt.Println("note: pg_stat_statements needs -apply -restart once to start capturing query stats.")
+		}
+	}
+
+	if opts.ApplyIndex {
+		for _, p := range perDBs {
+			if p.SkipReason != "" || p.DB == nil {
+				continue
+			}
+			c, ok := connectDB(p.DB.Database)
+			if !ok {
+				continue
+			}
+			if err := applyIndexes(ctx, c, opts, p.DB.Database, p.QA); err != nil {
+				fmt.Fprintf(os.Stderr, "error: index on %s: %v\n", p.DB.Database, err)
+			}
+			c.Close(ctx)
+		}
+	}
+}
+
+func dedupe(s []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, v := range s {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	return out
 }

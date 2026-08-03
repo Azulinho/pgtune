@@ -37,6 +37,74 @@ func printReport(sys *SysStats, db *DBStats, wl Workload, plan []PlanItem, qa *Q
 	fmt.Fprintf(w, "Superuser connection\t: %v\n", db.IsSuperuser)
 	w.Flush()
 
+	printLiveStats(w, "--- live stats ---", db)
+	printTuningPlan(w, plan)
+	printQueryAnalysis(w, qa)
+}
+
+// printAllReport prints one instance-level view (aggregated live stats and the
+// tuning plan) followed by a per-database deep dive (query analysis, findings,
+// index recommendations) for every analyzable database.
+func printAllReport(sys *SysStats, agg *DBStats, wl Workload, plan []PlanItem, perDBs []*PerDB) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+
+	fmt.Fprintln(w, "\n=== pgtune report (all databases) ===")
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "PostgreSQL\t: %s\n", agg.Version)
+	fmt.Fprintf(w, "Databases\t: %s\n", agg.Database)
+	fmt.Fprintf(w, "Uptime\t: %s\n", humanDuration(agg.UptimeSec))
+	fmt.Fprintf(w, "System\t: %s RAM, %d CPU, %s storage\n",
+		fmtBytes(sys.TotalMemBytes), sys.NumCPU, strings.ToUpper(sys.DiskType))
+	fmt.Fprintf(w, "Workload\t: %s\n", wl)
+	fmt.Fprintf(w, "Superuser connection\t: %v\n", agg.IsSuperuser)
+	w.Flush()
+
+	printLiveStats(w, "--- live stats (all databases) ---", agg)
+	printTuningPlan(w, plan)
+
+	skipped := 0
+	for _, p := range perDBs {
+		if p.SkipReason != "" {
+			skipped++
+			continue
+		}
+		fmt.Fprintf(w, "\n=== database: %s ===\n", p.DB.Database)
+		printDBCompact(w, p.DB)
+		printQueryAnalysis(w, p.QA)
+	}
+	if skipped > 0 {
+		fmt.Fprintln(w, "\nSkipped databases:")
+		for _, p := range perDBs {
+			if p.SkipReason != "" {
+				fmt.Fprintf(w, "  %s: %s\n", p.DB.Database, p.SkipReason)
+			}
+		}
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "note: run as a role with pg_read_all_stats (plus table privileges for EXPLAIN) to see all databases' statements; per-database changes apply with -analyze / -apply-index")
+	w.Flush()
+}
+
+// printDBCompact shows the per-database subset of live stats that actually
+// differs between databases on the same server.
+func printDBCompact(w *tabwriter.Writer, db *DBStats) {
+	hit := 0.0
+	if total := db.BlksHit + db.BlksRead; total > 0 {
+		hit = float64(db.BlksHit) / float64(total) * 100
+	}
+	idx := 0.0
+	if total := db.SeqScans + db.IdxScans; total > 0 {
+		idx = float64(db.IdxScans) / float64(total) * 100
+	}
+	fmt.Fprintf(w, "Database\t: %s (%s)\n", db.Database, fmtBytes(uint64(db.DatabaseSizeBytes)))
+	fmt.Fprintf(w, "Cache hit ratio\t: %.2f%%\n", hit)
+	fmt.Fprintf(w, "Transactions\t: %d commits / %d rollbacks\n", db.Commits, db.Rollbacks)
+	fmt.Fprintf(w, "Temp spill\t: %d files / %s\n", db.TempFiles, fmtBytes(uint64(db.TempBytes)))
+	fmt.Fprintf(w, "Index scan ratio\t: %.1f%% (seq=%d idx=%d)\n", idx, db.SeqScans, db.IdxScans)
+	w.Flush()
+}
+
+func printLiveStats(w *tabwriter.Writer, title string, db *DBStats) {
 	hit := 0.0
 	if total := db.BlksHit + db.BlksRead; total > 0 {
 		hit = float64(db.BlksHit) / float64(total) * 100
@@ -46,7 +114,7 @@ func printReport(sys *SysStats, db *DBStats, wl Workload, plan []PlanItem, qa *Q
 		idx = float64(db.IdxScans) / float64(total) * 100
 	}
 
-	fmt.Fprintln(w, "\n--- live stats ---")
+	fmt.Fprintln(w, "\n"+title)
 	fmt.Fprintf(w, "Cache hit ratio\t: %.2f%%\n", hit)
 	fmt.Fprintf(w, "Transactions\t: %d commits / %d rollbacks\n", db.Commits, db.Rollbacks)
 	fmt.Fprintf(w, "Deadlocks\t: %d\n", db.Deadlocks)
@@ -61,7 +129,9 @@ func printReport(sys *SysStats, db *DBStats, wl Workload, plan []PlanItem, qa *Q
 	fmt.Fprintf(w, "I/O timing\t: read %.0f ms / write %.0f ms (0 = track_io_timing off)\n",
 		db.BlkReadTimeMS, db.BlkWriteTimeMS)
 	w.Flush()
+}
 
+func printTuningPlan(w *tabwriter.Writer, plan []PlanItem) {
 	fmt.Fprintln(w, "\n--- tuning plan ---")
 	fmt.Fprintln(w, "PARAMETER\tCURRENT\tPROPOSED\tCONTEXT\tSTATUS")
 	for _, it := range plan {
@@ -93,8 +163,6 @@ func printReport(sys *SysStats, db *DBStats, wl Workload, plan []PlanItem, qa *Q
 		}
 	}
 	w.Flush()
-
-	printQueryAnalysis(w, qa)
 }
 
 func printQueryAnalysis(w *tabwriter.Writer, qa *QueryAnalysis) {

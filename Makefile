@@ -41,7 +41,7 @@ PROGRESS  ?= 5
 
 PG_CONN := PGPASSWORD=$(PGPASSWORD) pgbench -h $(PGHOST) -p $(PGPORT) -U $(PGUSER) -d $(PGDATABASE)
 
-.PHONY: help build test tune tune-index tune-restart tune-full tune-dry tune-olap pgss-reset load load-init load-readonly load-custom load-init-if-needed
+.PHONY: help build test tune tune-index tune-restart tune-full tune-dry tune-olap tune-all pgss-reset load load-init load-readonly load-custom load-init-if-needed
 
 help:
 	@echo "pgtune targets:"
@@ -53,6 +53,7 @@ help:
 	@echo "  make tune-full      everything: tune + restart + ANALYZE + recommended indexes"
 	@echo "  make tune-dry       show stats and plan without applying"
 	@echo "  make tune-olap      auto-tune for an analytics workload"
+	@echo "  make tune-all       analyze every database on the server (per-DB recommendations)"
 	@echo "  make pgss-reset     clear pg_stat_statements (before/after benchmark)"
 	@echo "  make load           run pgbench read/write benchmark (defaults: $(CLIENTS) clients, $(DURATION)s)"
 	@echo "  make load-readonly  SELECT-only benchmark"
@@ -91,6 +92,13 @@ tune-dry: build
 ## Auto-tune for an analytics/warehouse workload.
 tune-olap: build
 	$(PGTUNE) -apply -workload olap
+
+## Analyze every database on the server: one instance-level tuning plan
+## (evidence aggregated across databases) plus per-database deep dives with
+## their own recommendations (indexes, ANALYZE, etc.).
+## Best run as a role with pg_read_all_stats: see README "Multiple databases".
+tune-all: build
+	$(PGTUNE) -all-dbs -user $(PGUSER) -password $(PGPASSWORD) -port $(PGPORT)
 
 ## Clear pg_stat_statements so query stats start from zero (needs sudo).
 pgss-reset:
