@@ -6,7 +6,7 @@
 #   make help           - list all targets
 #   make build          - compile the pgtune binary
 #   make test           - run the unit tests
-#   make tune           - auto-tune: gather stats + apply tuning plan (needs sudo for ALTER SYSTEM)
+#   make tune           - auto-tune: gather stats + apply tuning plan (as postgres superuser)
 #   make tune-index     - create indexes recommended by seq-scan findings
 #   make tune-restart   - full config tune incl. pg_stat_statements install + restart + ANALYZE
 #   make tune-full      - everything: tune + restart + ANALYZE + recommended indexes
@@ -25,11 +25,13 @@ PGTUNE  := ./pgtune
 WORKLOAD ?= oltp
 
 # --- load test (pgbench) ---
+# Defaults match the pgtune binary: postgres superuser, direct TCP (5432).
+# For pgbouncer / an app role: make load PGPORT=6432 PGUSER=app PGPASSWORD=app PGDATABASE=app
 PGHOST    ?= 127.0.0.1
-PGPORT    ?= 6432          # pgbouncer; use 5432 to hit postgres directly
-PGUSER    ?= app
-PGPASSWORD?= app
-PGDATABASE?= app
+PGPORT    ?= 5432          # postgres direct; pgbouncer is 6432
+PGUSER    ?= postgres
+PGPASSWORD?= postgres
+PGDATABASE?= postgres
 
 CLIENTS   ?= 20
 THREADS   ?= 8

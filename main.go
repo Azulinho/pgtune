@@ -36,10 +36,10 @@ type Options struct {
 func main() {
 	opts := Options{}
 	flag.StringVar(&opts.Host, "host", "127.0.0.1", "PostgreSQL host")
-	flag.IntVar(&opts.Port, "port", 6432, "PostgreSQL port (6432 = pgbouncer, 5432 = direct)")
-	flag.StringVar(&opts.User, "user", "app", "PostgreSQL user")
-	flag.StringVar(&opts.Password, "password", "app", "PostgreSQL password")
-	flag.StringVar(&opts.DB, "db", "app", "Database to analyze")
+	flag.IntVar(&opts.Port, "port", 5432, "PostgreSQL port (5432 = direct, 6432 = pgbouncer)")
+	flag.StringVar(&opts.User, "user", "postgres", "PostgreSQL user")
+	flag.StringVar(&opts.Password, "password", "postgres", "PostgreSQL password")
+	flag.StringVar(&opts.DB, "db", "postgres", "Database to analyze")
 	flag.StringVar(&opts.Workload, "workload", "oltp", "Workload type: oltp, olap, mixed, desktop")
 	flag.BoolVar(&opts.Apply, "apply", false, "Apply the tuning plan (ALTER SYSTEM + reload)")
 	flag.BoolVar(&opts.Restart, "restart", false, "Restart postgres (via sudo systemctl) if the plan requires it")

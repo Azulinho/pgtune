@@ -20,8 +20,9 @@ make load           # generate workload, then re-run pgtune to see analysis
 
 ## How it works
 
-1. **Connect** — as the configured role (default `app/app` through pgbouncer on
-   port 6432; use `-port 5432` to go direct).
+1. **Connect** — as the configured role (default `postgres/postgres` direct on
+   port 5432, i.e. a superuser connection; pass `-port 6432 -user app -password
+   app -db app` to go through pgbouncer as the application role).
 
 2. **Collect stats**
    - System: RAM, CPU, disk type (SSD/HDD) from `/proc`.
@@ -81,10 +82,10 @@ plan, and it never downgrades memory parameters based on a lack of evidence
 ```
 pgtune [flags]
   -host string          PostgreSQL host (default "127.0.0.1")
-  -port int             PostgreSQL port: 6432 pgbouncer / 5432 direct (default 6432)
-  -user string          (default "app")
-  -password string      (default "app")
-  -db string            database to analyze (default "app")
+  -port int             PostgreSQL port: 5432 direct / 6432 pgbouncer (default 5432)
+  -user string          (default "postgres")
+  -password string      (default "postgres")
+  -db string            database to analyze (default "postgres")
   -workload string      oltp | olap | mixed | desktop (default "oltp")
   -apply                apply the plan (ALTER SYSTEM + reload)
   -apply-index          create indexes recommended by seq-scan findings
@@ -104,9 +105,10 @@ pgtune [flags]
 Examples:
 
 ```bash
+./pgtune                                    # defaults: postgres/postgres@5432/postgres
+./pgtune -port 6432 -user app -password app -db app   # via pgbouncer as the app role
 ./pgtune -workload olap -apply -restart -analyze   # full analytics auto-tune
 ./pgtune -apply-index                             # create recommended indexes
-./pgtune -port 5432 -apply                         # connect direct to postgres
 ./pgtune -sudo=false                               # print SQL instead of applying
 ./pgtune -explain 0                                # skip EXPLAIN (faster, read-only)
 ./pgtune -all-dbs                                  # every database on the server
@@ -130,11 +132,14 @@ problems" while a second database recommends a new index.
 
 ### Permissions
 
-Since PostgreSQL 15, a non-superuser can only see their *own* statements in
+With the default `postgres` superuser login you see every database's
+statements, table stats and histograms with no extra setup - `make tune-all`
+just works. If you run as a non-superuser instead, note that since PostgreSQL
+15 a non-superuser can only see their *own* statements in
 `pg_stat_statements` and their own tables' `pg_stats` histograms, so a plain
 `app` user gets an incomplete picture of other databases. For the full
-cross-database view, run as a role with `pg_read_all_stats` (plus table
-privileges so EXPLAIN can plan the queries):
+cross-database view as a non-superuser, use a role with `pg_read_all_stats`
+(plus table privileges so EXPLAIN can plan the queries):
 
 ```sql
 CREATE ROLE pgtune LOGIN PASSWORD 'pgtune';
@@ -143,7 +148,7 @@ GRANT pg_read_all_stats TO pgtune;
 ```
 
 ```bash
-make tune-all PGPORT=5432 PGUSER=pgtune PGPASSWORD=pgtune   # = ./pgtune -all-dbs ...
+make tune-all PGPORT=5432 PGUSER=pgtune PGPASSWORD=pgtune   # non-superuser variant
 ```
 
 Databases you cannot connect to are listed as skipped. The maintenance
@@ -157,6 +162,7 @@ this automatically with `-apply`).
 make load                      # 20 clients / 8 threads / 60s (auto-inits schema)
 make load CLIENTS=100 DURATION=120
 make load-readonly             # SELECT-only
+make load PGPORT=6432 PGUSER=app PGPASSWORD=app PGDATABASE=app   # through pgbouncer
 make load-custom F=my.sql
 ```
 
