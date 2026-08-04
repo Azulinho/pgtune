@@ -26,6 +26,7 @@ type Options struct {
 	TopN           int
 	ExplainN       int
 	LongRunningSec float64
+	Timeout        time.Duration
 	TablesN        int
 	InstallPgss    bool
 	Analyze        bool
@@ -35,6 +36,7 @@ type Options struct {
 
 func main() {
 	opts := Options{}
+	var timeoutSec int
 	flag.StringVar(&opts.Host, "host", "127.0.0.1", "PostgreSQL host")
 	flag.IntVar(&opts.Port, "port", 5432, "PostgreSQL port (5432 = direct, 6432 = pgbouncer)")
 	flag.StringVar(&opts.User, "user", "postgres", "PostgreSQL user")
@@ -47,6 +49,7 @@ func main() {
 	flag.IntVar(&opts.TopN, "top", 8, "number of top queries to report from pg_stat_statements")
 	flag.IntVar(&opts.ExplainN, "explain", 3, "how many top queries to EXPLAIN (0 disables)")
 	flag.Float64Var(&opts.LongRunningSec, "long-running", 5.0, "flag queries running longer than this many seconds")
+	flag.IntVar(&timeoutSec, "timeout", 60, "seconds allowed per database operation (connect, stats, query analysis, apply step)")
 	flag.IntVar(&opts.TablesN, "tables", 10, "number of largest tables to analyze")
 	flag.BoolVar(&opts.InstallPgss, "install-pgss", true, "Install pg_stat_statements (extension + preload) when missing")
 	flag.BoolVar(&opts.Analyze, "analyze", false, "Run ANALYZE when stale statistics are detected (apply mode)")
@@ -54,39 +57,55 @@ func main() {
 	flag.BoolVar(&opts.AllDBs, "all-dbs", false, "Analyze every database on the server (per-database recommendations)")
 	flag.Parse()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
+	opts.Timeout = time.Duration(timeoutSec) * time.Second
+	if opts.Timeout <= 0 {
+		fmt.Fprintf(os.Stderr, "error: -timeout must be > 0\n")
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
 
 	dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
 		url.QueryEscape(opts.User), url.QueryEscape(opts.Password), opts.Host, opts.Port, url.QueryEscape(opts.DB))
 
-	conn, err := pgx.Connect(ctx, dsn)
+	cctx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	conn, err := pgx.Connect(cctx, dsn)
+	cancel()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: cannot connect to %s:%d as %s: %v\n", opts.Host, opts.Port, opts.User, err)
+		fmt.Fprintf(os.Stderr, "error: cannot connect to %s:%d as %s: %v\n", opts.Host, opts.Port, opts.User, timeoutReason(opts, err))
 		os.Exit(1)
 	}
-	defer conn.Close(ctx)
+	defer func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn.Close(cctx)
+	}()
 
-	sys, err := collectSysStats(ctx, conn)
+	dctx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	sys, err := collectSysStats(dctx, conn)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: system stats: %v\n", err)
+		cancel()
+		fmt.Fprintf(os.Stderr, "error: system stats: %v\n", timeoutReason(opts, err))
 		os.Exit(1)
 	}
-	db, err := collectDBStats(ctx, conn)
+	db, err := collectDBStats(dctx, conn)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: database stats: %v\n", err)
+		cancel()
+		fmt.Fprintf(os.Stderr, "error: database stats: %v\n", timeoutReason(opts, err))
 		os.Exit(1)
 	}
 
 	wl, err := parseWorkload(opts.Workload)
 	if err != nil {
+		cancel()
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	qa, err := collectQueryAnalysis(ctx, conn, opts, db)
+	qa, err := collectQueryAnalysis(dctx, conn, opts, db)
+	cancel()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: query analysis: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error: query analysis: %v\n", timeoutReason(opts, err))
 		os.Exit(1)
 	}
 
@@ -101,31 +120,41 @@ func main() {
 	if opts.Apply {
 		var reasons []string
 
-		r, err := applySettings(ctx, conn, db, plan, opts)
+		actx, cancel := context.WithTimeout(ctx, opts.Timeout)
+		r, err := applySettings(actx, conn, db, plan, opts)
+		cancel()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: apply: %v\n", err)
+			fmt.Fprintf(os.Stderr, "error: apply: %v\n", timeoutReason(opts, err))
 			os.Exit(1)
 		}
 		reasons = append(reasons, r...)
 
 		if opts.InstallPgss {
-			r, err = applyPgss(ctx, conn, opts, db.Database)
+			actx, cancel := context.WithTimeout(ctx, opts.Timeout)
+			r, err = applyPgss(actx, conn, opts, db.Database)
+			cancel()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "error: pg_stat_statements: %v\n", err)
+				fmt.Fprintf(os.Stderr, "error: pg_stat_statements: %v\n", timeoutReason(opts, err))
 				os.Exit(1)
 			}
 			reasons = append(reasons, r...)
 		}
 
 		if opts.Analyze {
-			if err := applyAnalyze(ctx, opts, db.Database, qa); err != nil {
-				fmt.Fprintf(os.Stderr, "error: analyze: %v\n", err)
+			actx, cancel := context.WithTimeout(ctx, opts.Timeout)
+			err = applyAnalyze(actx, opts, db.Database, qa)
+			cancel()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: analyze: %v\n", timeoutReason(opts, err))
 				os.Exit(1)
 			}
 		}
 
-		if err := doRestart(ctx, opts, reasons); err != nil {
-			fmt.Fprintf(os.Stderr, "error: restart: %v\n", err)
+		actx, cancel = context.WithTimeout(ctx, opts.Timeout)
+		err = doRestart(actx, opts, reasons)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: restart: %v\n", timeoutReason(opts, err))
 			os.Exit(1)
 		}
 	} else {
@@ -136,8 +165,11 @@ func main() {
 	}
 
 	if opts.ApplyIndex {
-		if err := applyIndexes(ctx, conn, opts, opts.DB, qa); err != nil {
-			fmt.Fprintf(os.Stderr, "error: index: %v\n", err)
+		actx, cancel := context.WithTimeout(ctx, opts.Timeout)
+		err := applyIndexes(actx, conn, opts, opts.DB, qa)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: index: %v\n", timeoutReason(opts, err))
 			os.Exit(1)
 		}
 	}
@@ -163,18 +195,22 @@ func runAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, sys *SysStats,
 	// per-database connections for apply steps (the primary connection is
 	// reused only for the instance-wide settings)
 	connectDB := func(name string) (*pgx.Conn, bool) {
-		c, err := pgx.Connect(ctx, dsnFor(opts, name))
+		actx, cancel := context.WithTimeout(ctx, opts.Timeout)
+		defer cancel()
+		c, err := pgx.Connect(actx, dsnFor(opts, name))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: cannot connect to %s for apply: %v\n", name, err)
+			fmt.Fprintf(os.Stderr, "warning: cannot connect to %s for apply: %v\n", name, timeoutReason(opts, err))
 			return nil, false
 		}
 		return c, true
 	}
 
 	if opts.Apply {
-		reasons, err := applySettings(ctx, conn, agg, plan, opts)
+		actx, cancel := context.WithTimeout(ctx, opts.Timeout)
+		reasons, err := applySettings(actx, conn, agg, plan, opts)
+		cancel()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: apply: %v\n", err)
+			fmt.Fprintf(os.Stderr, "error: apply: %v\n", timeoutReason(opts, err))
 			os.Exit(1)
 		}
 
@@ -187,10 +223,12 @@ func runAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, sys *SysStats,
 				if !ok {
 					continue
 				}
-				r, err := applyPgss(ctx, c, opts, p.DB.Database)
-				c.Close(ctx)
+				actx, cancel := context.WithTimeout(ctx, opts.Timeout)
+				r, err := applyPgss(actx, c, opts, p.DB.Database)
+				c.Close(actx)
+				cancel()
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "warning: pg_stat_statements on %s: %v\n", p.DB.Database, err)
+					fmt.Fprintf(os.Stderr, "warning: pg_stat_statements on %s: %v\n", p.DB.Database, timeoutReason(opts, err))
 					continue
 				}
 				reasons = append(reasons, r...)
@@ -202,14 +240,20 @@ func runAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, sys *SysStats,
 				if p.SkipReason != "" || p.DB == nil {
 					continue
 				}
-				if err := applyAnalyze(ctx, opts, p.DB.Database, p.QA); err != nil {
-					fmt.Fprintf(os.Stderr, "warning: ANALYZE on %s: %v\n", p.DB.Database, err)
+				actx, cancel := context.WithTimeout(ctx, opts.Timeout)
+				err := applyAnalyze(actx, opts, p.DB.Database, p.QA)
+				cancel()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "warning: ANALYZE on %s: %v\n", p.DB.Database, timeoutReason(opts, err))
 				}
 			}
 		}
 
-		if err := doRestart(ctx, opts, dedupe(reasons)); err != nil {
-			fmt.Fprintf(os.Stderr, "error: restart: %v\n", err)
+		actx, cancel = context.WithTimeout(ctx, opts.Timeout)
+		err = doRestart(actx, opts, dedupe(reasons))
+		cancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: restart: %v\n", timeoutReason(opts, err))
 			os.Exit(1)
 		}
 	} else {
@@ -228,10 +272,13 @@ func runAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, sys *SysStats,
 			if !ok {
 				continue
 			}
-			if err := applyIndexes(ctx, c, opts, p.DB.Database, p.QA); err != nil {
-				fmt.Fprintf(os.Stderr, "error: index on %s: %v\n", p.DB.Database, err)
+			actx, cancel := context.WithTimeout(ctx, opts.Timeout)
+			err := applyIndexes(actx, c, opts, p.DB.Database, p.QA)
+			c.Close(actx)
+			cancel()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: index on %s: %v\n", p.DB.Database, timeoutReason(opts, err))
 			}
-			c.Close(ctx)
 		}
 	}
 }

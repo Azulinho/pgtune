@@ -73,6 +73,37 @@ make load           # generate workload, then re-run pgtune to see analysis
    which every run reports real query statistics. `make tune-restart` does this
    automatically; use `-install-pgss=false` to opt out.
 
+### pg_stat_statements: one server-wide library, per-database views
+
+`pg_stat_statements` is easy to confuse because it has two separate parts:
+
+1. **The library** (`shared_preload_libraries = 'pg_stat_statements'`) is
+   **server-wide**: it loads once at postmaster start and captures statement
+   statistics in shared memory for every database on the cluster. This is the
+   part pgtune enables during bootstrap (`-apply -restart`, one restart).
+2. **The extension** (`CREATE EXTENSION pg_stat_statements`) is
+   **per-database**: it creates the `pg_stat_statements` view object in one
+   specific database. The view has to be created separately in each database
+   where you want to read the captured statistics.
+
+pgtune installs the extension in the database(s) it is pointed at: the `-db`
+target, or every database with `-all-dbs -apply`. It never creates a helper
+database for this and does not need one - the shared library is the capture
+engine, the per-database view is just a window into it.
+
+The per-database report tells you which state each database is in:
+
+| Report line | What it means |
+|---|---|
+| `capturing (preloaded)` | library preloaded **and** the view exists in this database - stats are readable here |
+| `installed but not preloaded` | the extension exists here but the library is not in `shared_preload_libraries` - capturing starts only after a restart |
+| `not installed and not preloaded` | the view does not exist in this database (the extension was never created here). The "not preloaded" wording is per-database and can be misleading: the library may already be preloaded server-wide - the fix is `-apply` / `-all-dbs -apply` to create the extension in this database too |
+
+So it is normal for one database to show `capturing (preloaded)` while a
+sibling database on the same server shows `not installed and not preloaded`:
+the library is shared, but each database needs its own `CREATE EXTENSION`.
+`./pgtune -all-dbs -apply` closes the gap automatically.
+
 The app is idempotent: re-running applies nothing once the instance matches the
 plan, and it never downgrades memory parameters based on a lack of evidence
 (no ping-pong between values).
@@ -97,6 +128,7 @@ pgtune [flags]
   -top int              number of top queries from pg_stat_statements (default 8)
   -explain int          how many top queries to EXPLAIN, 0 disables (default 3)
   -long-running float   flag queries running longer than this many seconds (default 5)
+  -timeout int          seconds allowed per database operation (default 60)
   -tables int           number of largest tables to analyze (default 10)
   -all-dbs              analyze every database on the server, one instance
                         plan + per-database recommendations

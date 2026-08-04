@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -294,7 +295,9 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options, db 
 	}
 
 	// EXPLAIN ANALYZE / GENERIC_PLAN on the most expensive eligible queries.
-	explainTopQueries(ctx, conn, qa, opts.ExplainN)
+	if err := explainTopQueries(ctx, conn, qa, opts.ExplainN); err != nil {
+		return nil, err
+	}
 
 	return qa, nil
 }
@@ -302,10 +305,12 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options, db 
 // explainTopQueries runs EXPLAIN on the top queries. SELECT-only queries are
 // safe to ANALYZE; parameterized ones get a plain EXPLAIN (no execution) with
 // bound values so the planner estimates selectivity realistically. DML is
-// skipped (EXPLAIN ANALYZE would execute it).
-func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, explainN int) {
+// skipped (EXPLAIN ANALYZE would execute it). A context deadline (per-DB
+// budget exhausted) is returned as an error so the caller records the
+// database as skipped; all other failures stay explain-error findings.
+func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, explainN int) error {
 	if conn == nil || explainN <= 0 {
-		return
+		return nil
 	}
 	done := 0
 	for i := range qa.Top {
@@ -342,6 +347,9 @@ func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, e
 				}
 			}
 			if err := conn.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+sql, args...).Scan(&out); err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					return err
+				}
 				// when the probe succeeded the failure is real (e.g. permission
 				// denied); when we shot blind with dummy 1 it is usually just a
 				// type mismatch of the placeholder, which says nothing about the
@@ -359,9 +367,15 @@ func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, e
 			}
 		} else {
 			if _, err := conn.Exec(ctx, "SET statement_timeout = 5000"); err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					return err
+				}
 				continue
 			}
 			if err := conn.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+sql).Scan(&out); err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					return err
+				}
 				qa.Findings = append(qa.Findings, Finding{
 					Kind:       "explain-error",
 					QueryID:    q.QueryID,
@@ -382,6 +396,7 @@ func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, e
 		}
 		done++
 	}
+	return nil
 }
 
 // countParams returns the highest $n placeholder number in a query.

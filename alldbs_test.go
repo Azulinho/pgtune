@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func mkStats(name string, blksHit, blksRead, size int64) *DBStats {
@@ -77,6 +80,16 @@ func TestAggregateQA(t *testing.T) {
 	}
 	if countFinding(agg, "disk-sort") != 1 || countFinding(agg, "stale-stats") != 1 {
 		t.Error("kind counts must reflect deduped findings")
+	}
+}
+
+func TestTimeoutReason(t *testing.T) {
+	got := timeoutReason(Options{Timeout: 60 * time.Second}, context.DeadlineExceeded)
+	if !strings.Contains(got, "timed out after") || !strings.Contains(got, "-timeout") {
+		t.Errorf("timeoutReason(deadline) = %q, want hint mentioning 'timed out after' and -timeout", got)
+	}
+	if got := timeoutReason(Options{}, errors.New("boom")); got != "boom" {
+		t.Errorf("timeoutReason(non-deadline) = %q, want 'boom' verbatim", got)
 	}
 }
 

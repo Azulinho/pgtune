@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"sort"
@@ -47,10 +48,21 @@ func listDatabases(ctx context.Context, conn *pgx.Conn) ([]string, error) {
 	return names, rows.Err()
 }
 
+// timeoutReason converts a context deadline into an actionable skip reason;
+// other errors pass through verbatim.
+func timeoutReason(opts Options, err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Sprintf("timed out after %s - server busy or unresponsive; raise with -timeout", opts.Timeout)
+	}
+	return err.Error()
+}
+
 // collectAllDBs analyzes every database on the server. The primary database
 // (the one the process is connected to) comes first and reuses the already
 // collected stats; the others get their own connections. Databases that
 // cannot be connected to are recorded with a SkipReason, not errors.
+// Collection stays serial; each database gets its own -timeout budget, so a
+// slow database skips itself (with a truthful reason) without starving the rest.
 func collectAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, primaryDB *DBStats, primaryQA *QueryAnalysis) []*PerDB {
 	names, err := listDatabases(ctx, conn)
 	if err != nil {
@@ -74,21 +86,25 @@ func collectAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, primaryDB 
 			out = append(out, &PerDB{DB: primaryDB, QA: primaryQA})
 			continue
 		}
-		c, err := pgx.Connect(ctx, dsnFor(opts, name))
+		dctx, cancel := context.WithTimeout(ctx, opts.Timeout)
+		c, err := pgx.Connect(dctx, dsnFor(opts, name))
 		if err != nil {
-			out = append(out, &PerDB{DB: &DBStats{Database: name}, SkipReason: err.Error()})
+			cancel()
+			out = append(out, &PerDB{DB: &DBStats{Database: name}, SkipReason: timeoutReason(opts, err)})
 			continue
 		}
-		db, err := collectDBStats(ctx, c)
+		db, err := collectDBStats(dctx, c)
 		if err != nil {
-			c.Close(ctx)
-			out = append(out, &PerDB{DB: &DBStats{Database: name}, SkipReason: "stats: " + err.Error()})
+			c.Close(dctx)
+			cancel()
+			out = append(out, &PerDB{DB: &DBStats{Database: name}, SkipReason: "stats: " + timeoutReason(opts, err)})
 			continue
 		}
-		qa, err := collectQueryAnalysis(ctx, c, opts, db)
-		c.Close(ctx)
+		qa, err := collectQueryAnalysis(dctx, c, opts, db)
+		c.Close(dctx)
+		cancel()
 		if err != nil {
-			out = append(out, &PerDB{DB: db, SkipReason: "query analysis: " + err.Error()})
+			out = append(out, &PerDB{DB: db, SkipReason: "query analysis: " + timeoutReason(opts, err)})
 			continue
 		}
 		out = append(out, &PerDB{DB: db, QA: qa})
