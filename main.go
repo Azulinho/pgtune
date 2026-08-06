@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/user"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -19,12 +21,12 @@ type Options struct {
 	User           string
 	Password       string
 	DB             string
+	SslMode        string
 	Workload       string
 	Apply          bool
-	Restart        bool
-	UseSudo        bool
 	TopN           int
 	ExplainN       int
+	ExplainTimeout time.Duration
 	LongRunningSec float64
 	Timeout        time.Duration
 	TablesN        int
@@ -32,22 +34,57 @@ type Options struct {
 	Analyze        bool
 	ApplyIndex     bool
 	AllDBs         bool
+	Ram            string
+}
+
+// envOr returns the named environment variable, or def when unset/empty.
+// The standard libpq environment variables (PGHOST, PGPORT, PGUSER,
+// PGPASSWORD, PGDATABASE, PGSSLMODE) are honored as flag defaults.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envPort(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// defaultUser mirrors psql: the connecting role defaults to the current OS
+// user, which peer authentication over the local unix socket accepts without
+// a password (running as the postgres OS user gives the postgres role).
+func defaultUser() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	if u := os.Getenv("USER"); u != "" {
+		return u
+	}
+	return "postgres"
 }
 
 func main() {
 	opts := Options{}
 	var timeoutSec int
-	flag.StringVar(&opts.Host, "host", "127.0.0.1", "PostgreSQL host")
-	flag.IntVar(&opts.Port, "port", 5432, "PostgreSQL port (5432 = direct, 6432 = pgbouncer)")
-	flag.StringVar(&opts.User, "user", "postgres", "PostgreSQL user")
-	flag.StringVar(&opts.Password, "password", "postgres", "PostgreSQL password")
-	flag.StringVar(&opts.DB, "db", "postgres", "Database to analyze")
+	var explainTimeoutSec int
+	flag.StringVar(&opts.Host, "host", envOr("PGHOST", ""), "PostgreSQL host (default: local unix socket, like psql)")
+	flag.IntVar(&opts.Port, "port", envPort("PGPORT", 5432), "PostgreSQL port")
+	flag.StringVar(&opts.User, "user", envOr("PGUSER", defaultUser()), "PostgreSQL user (default: current OS user, like psql)")
+	flag.StringVar(&opts.Password, "password", envOr("PGPASSWORD", ""), "PostgreSQL password (also read from PGPASSWORD)")
+	flag.StringVar(&opts.DB, "db", envOr("PGDATABASE", "postgres"), "Database to analyze")
+	flag.StringVar(&opts.SslMode, "sslmode", envOr("PGSSLMODE", "prefer"), "SSL mode: disable, allow, prefer, require, verify-ca, verify-full")
+	flag.StringVar(&opts.Ram, "ram", "", "Total RAM override, e.g. 32GB (default: read from /proc/meminfo)")
 	flag.StringVar(&opts.Workload, "workload", "oltp", "Workload type: oltp, olap, mixed, desktop")
 	flag.BoolVar(&opts.Apply, "apply", false, "Apply the tuning plan (ALTER SYSTEM + reload)")
-	flag.BoolVar(&opts.Restart, "restart", false, "Restart postgres (via sudo systemctl) if the plan requires it")
-	flag.BoolVar(&opts.UseSudo, "sudo", true, "Use `sudo -u postgres psql` to apply changes when the connected user lacks superuser rights")
 	flag.IntVar(&opts.TopN, "top", 8, "number of top queries to report from pg_stat_statements")
 	flag.IntVar(&opts.ExplainN, "explain", 3, "how many top queries to EXPLAIN (0 disables)")
+	flag.IntVar(&explainTimeoutSec, "explain-timeout", 5, "seconds allowed for EXPLAIN ANALYZE execution (0 = no limit)")
 	flag.Float64Var(&opts.LongRunningSec, "long-running", 5.0, "flag queries running longer than this many seconds")
 	flag.IntVar(&timeoutSec, "timeout", 60, "seconds allowed per database operation (connect, stats, query analysis, apply step)")
 	flag.IntVar(&opts.TablesN, "tables", 10, "number of largest tables to analyze")
@@ -58,6 +95,7 @@ func main() {
 	flag.Parse()
 
 	opts.Timeout = time.Duration(timeoutSec) * time.Second
+	opts.ExplainTimeout = time.Duration(explainTimeoutSec) * time.Second
 	if opts.Timeout <= 0 {
 		fmt.Fprintf(os.Stderr, "error: -timeout must be > 0\n")
 		os.Exit(1)
@@ -65,8 +103,8 @@ func main() {
 
 	ctx := context.Background()
 
-	dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
-		url.QueryEscape(opts.User), url.QueryEscape(opts.Password), opts.Host, opts.Port, url.QueryEscape(opts.DB))
+	dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
+		url.QueryEscape(opts.User), url.QueryEscape(opts.Password), opts.Host, opts.Port, url.QueryEscape(opts.DB), opts.SslMode)
 
 	cctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	conn, err := pgx.Connect(cctx, dsn)
@@ -82,7 +120,7 @@ func main() {
 	}()
 
 	dctx, cancel := context.WithTimeout(ctx, opts.Timeout)
-	sys, err := collectSysStats(dctx, conn)
+	sys, err := collectSysStats(dctx, conn, opts)
 	if err != nil {
 		cancel()
 		fmt.Fprintf(os.Stderr, "error: system stats: %v\n", timeoutReason(opts, err))
@@ -115,13 +153,13 @@ func main() {
 	}
 
 	plan := buildPlan(sys, db, wl, qa)
-	printReport(sys, db, wl, plan, qa)
+	printReport(os.Stdout, sys, db, wl, plan, qa)
 
 	if opts.Apply {
 		var reasons []string
 
 		actx, cancel := context.WithTimeout(ctx, opts.Timeout)
-		r, err := applySettings(actx, conn, db, plan, opts)
+		r, err := applySettings(actx, conn, db, plan)
 		cancel()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: apply: %v\n", timeoutReason(opts, err))
@@ -131,7 +169,7 @@ func main() {
 
 		if opts.InstallPgss {
 			actx, cancel := context.WithTimeout(ctx, opts.Timeout)
-			r, err = applyPgss(actx, conn, opts, db.Database)
+			r, err = applyPgss(actx, conn)
 			cancel()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: pg_stat_statements: %v\n", timeoutReason(opts, err))
@@ -142,7 +180,7 @@ func main() {
 
 		if opts.Analyze {
 			actx, cancel := context.WithTimeout(ctx, opts.Timeout)
-			err = applyAnalyze(actx, opts, db.Database, qa)
+			err = applyAnalyze(actx, conn, opts, db.Database, qa)
 			cancel()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: analyze: %v\n", timeoutReason(opts, err))
@@ -150,23 +188,17 @@ func main() {
 			}
 		}
 
-		actx, cancel = context.WithTimeout(ctx, opts.Timeout)
-		err = doRestart(actx, opts, reasons)
-		cancel()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: restart: %v\n", timeoutReason(opts, err))
-			os.Exit(1)
-		}
+		noteRestart(dedupe(reasons))
 	} else {
 		fmt.Println("\nRun with -apply to apply these changes (ALTER SYSTEM + reload).")
 		if qa != nil && qa.RestartNeeded {
-			fmt.Println("note: pg_stat_statements needs -apply -restart once to start capturing query stats.")
+			fmt.Println("note: pg_stat_statements needs -apply once, plus a manual PostgreSQL restart, to start capturing query stats.")
 		}
 	}
 
 	if opts.ApplyIndex {
 		actx, cancel := context.WithTimeout(ctx, opts.Timeout)
-		err := applyIndexes(actx, conn, opts, opts.DB, qa)
+		err := applyIndexes(actx, conn, qa)
 		cancel()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: index: %v\n", timeoutReason(opts, err))
@@ -190,7 +222,7 @@ func runAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, sys *SysStats,
 	agg := aggregateDBStats(perDBs)
 	aggQA := aggregateQA(perDBs)
 	plan := buildPlan(sys, agg, wl, aggQA)
-	printAllReport(sys, agg, wl, plan, perDBs)
+	printAllReport(os.Stdout, sys, agg, wl, plan, perDBs)
 
 	// per-database connections for apply steps (the primary connection is
 	// reused only for the instance-wide settings)
@@ -207,7 +239,7 @@ func runAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, sys *SysStats,
 
 	if opts.Apply {
 		actx, cancel := context.WithTimeout(ctx, opts.Timeout)
-		reasons, err := applySettings(actx, conn, agg, plan, opts)
+		reasons, err := applySettings(actx, conn, agg, plan)
 		cancel()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: apply: %v\n", timeoutReason(opts, err))
@@ -224,7 +256,7 @@ func runAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, sys *SysStats,
 					continue
 				}
 				actx, cancel := context.WithTimeout(ctx, opts.Timeout)
-				r, err := applyPgss(actx, c, opts, p.DB.Database)
+				r, err := applyPgss(actx, c)
 				c.Close(actx)
 				cancel()
 				if err != nil {
@@ -240,8 +272,13 @@ func runAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, sys *SysStats,
 				if p.SkipReason != "" || p.DB == nil {
 					continue
 				}
+				c, ok := connectDB(p.DB.Database)
+				if !ok {
+					continue
+				}
 				actx, cancel := context.WithTimeout(ctx, opts.Timeout)
-				err := applyAnalyze(actx, opts, p.DB.Database, p.QA)
+				err := applyAnalyze(actx, c, opts, p.DB.Database, p.QA)
+				c.Close(actx)
 				cancel()
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "warning: ANALYZE on %s: %v\n", p.DB.Database, timeoutReason(opts, err))
@@ -249,17 +286,11 @@ func runAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, sys *SysStats,
 			}
 		}
 
-		actx, cancel = context.WithTimeout(ctx, opts.Timeout)
-		err = doRestart(actx, opts, dedupe(reasons))
-		cancel()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: restart: %v\n", timeoutReason(opts, err))
-			os.Exit(1)
-		}
+		noteRestart(dedupe(reasons))
 	} else {
 		fmt.Println("\nRun with -apply to apply the instance plan (ALTER SYSTEM + reload); -analyze / -apply-index apply per database.")
 		if aggQA != nil && aggQA.RestartNeeded {
-			fmt.Println("note: pg_stat_statements needs -apply -restart once to start capturing query stats.")
+			fmt.Println("note: pg_stat_statements needs -apply once, plus a manual PostgreSQL restart, to start capturing query stats.")
 		}
 	}
 
@@ -273,7 +304,7 @@ func runAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, sys *SysStats,
 				continue
 			}
 			actx, cancel := context.WithTimeout(ctx, opts.Timeout)
-			err := applyIndexes(actx, c, opts, p.DB.Database, p.QA)
+			err := applyIndexes(actx, c, p.QA)
 			c.Close(actx)
 			cancel()
 			if err != nil {

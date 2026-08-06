@@ -57,21 +57,150 @@ type DBStats struct {
 	Settings          map[string]Setting
 }
 
-func collectSysStats(ctx context.Context, conn *pgx.Conn) (*SysStats, error) {
+// collectSysStats gathers system facts for the tuning plan. System stats are
+// read from the database server host itself through pg_read_file - the same
+// server-side file access a local postgres user's psql session has - so the
+// plan stays correct even when the connection is remote. pg_read_file is
+// superuser-only; roles without it fall back to this client's own /proc
+// (authoritative for local connections, warned about otherwise). -ram always
+// wins over both.
+func collectSysStats(ctx context.Context, conn *pgx.Conn, opts Options) (*SysStats, error) {
 	sys := &SysStats{NumCPU: runtime.NumCPU()}
-	if kb, err := readMemTotalKB(); err == nil {
-		sys.TotalMemBytes = kb * 1024
-	} else {
-		sys.TotalMemBytes = 8 * GiB
-	}
 
-	sys.DataDir = "/var/lib/postgresql"
+	// data_directory is only readable by superusers; when the connected role
+	// cannot read it, leave the data dir unknown and let disk detection fall
+	// back to scanning /sys/block (no platform-specific default path).
 	var dd string
 	if err := conn.QueryRow(ctx, "SELECT setting FROM pg_settings WHERE name = 'data_directory'").Scan(&dd); err == nil && dd != "" {
 		sys.DataDir = dd
 	}
-	sys.DiskType = detectDiskType(sys.DataDir)
+
+	if opts.Ram != "" {
+		ram, err := parseRam(opts.Ram)
+		if err != nil {
+			return nil, fmt.Errorf("-ram %q: %w", opts.Ram, err)
+		}
+		sys.TotalMemBytes = ram
+	}
+
+	serverSide := false
+	if opts.Ram == "" {
+		if content, err := serverFile(ctx, conn, "/proc/meminfo"); err == nil {
+			if kb, err := memTotalFrom(content); err == nil {
+				sys.TotalMemBytes = kb * 1024
+				serverSide = true
+			}
+		}
+	}
+	if content, err := serverFile(ctx, conn, "/proc/cpuinfo"); err == nil {
+		if n := cpuCountFrom(content); n > 0 {
+			sys.NumCPU = n
+			serverSide = true
+		}
+	}
+	if !serverSide {
+		if opts.Ram == "" {
+			if kb, err := readMemTotalKB(); err == nil {
+				sys.TotalMemBytes = kb * 1024
+			} else {
+				fmt.Fprintf(os.Stderr, "warning: cannot read /proc/meminfo (%v) - assuming 8 GiB RAM; use -ram to override\n", err)
+				sys.TotalMemBytes = 8 * GiB
+			}
+		}
+		if !localHost(opts.Host) {
+			fmt.Fprintf(os.Stderr, "warning: system stats (RAM/CPU) read from the client host, not the database server (pg_read_file needs superuser) - run on the server host or pass -ram for accurate tuning\n")
+		}
+	}
+
+	if sys.DiskType = detectDiskTypeServer(ctx, conn, sys.DataDir); sys.DiskType == "" {
+		sys.DiskType = detectDiskType(sys.DataDir) // client-side fallback
+	}
 	return sys, nil
+}
+
+// serverFile reads a file on the database server host through pg_read_file,
+// exactly like a local postgres user's psql session could. Only superusers
+// can execute pg_read_file; restricted roles get an error here and callers
+// fall back to client-side reads.
+func serverFile(ctx context.Context, conn *pgx.Conn, path string) (string, error) {
+	var content string
+	if err := conn.QueryRow(ctx, "SELECT pg_read_file($1)", path).Scan(&content); err != nil {
+		return "", err
+	}
+	return content, nil
+}
+
+// memTotalFrom parses MemTotal (in kB) from /proc/meminfo content.
+func memTotalFrom(content string) (uint64, error) {
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, "MemTotal:") {
+			f := strings.Fields(line)
+			if len(f) >= 2 {
+				return strconv.ParseUint(f[1], 10, 64)
+			}
+		}
+	}
+	return 0, fmt.Errorf("MemTotal not found in /proc/meminfo")
+}
+
+// cpuCountFrom counts the "processor" entries in /proc/cpuinfo content.
+func cpuCountFrom(content string) int {
+	n := 0
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, "processor") {
+			n++
+		}
+	}
+	return n
+}
+
+// localHost reports whether the connection target is the machine this process
+// runs on (unix socket or loopback) - i.e. this client's /proc reads describe
+// the database server. A socket path (leading "/") is always local.
+func localHost(host string) bool {
+	if host == "" || strings.HasPrefix(host, "/") {
+		return true
+	}
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
+var ramSuffixes = []struct {
+	suffix string
+	mult   uint64
+}{
+	{"TB", 1 << 40},
+	{"GB", 1 << 30},
+	{"MB", 1 << 20},
+	{"KB", 1 << 10},
+	{"B", 1},
+}
+
+// parseRam converts a -ram value ("32GB", "16384MB", "16777216") to bytes.
+func parseRam(s string) (uint64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty value")
+	}
+	upper := strings.ToUpper(s)
+	for _, rs := range ramSuffixes {
+		if strings.HasSuffix(upper, rs.suffix) {
+			num := strings.TrimSpace(s[:len(s)-len(rs.suffix)])
+			v, err := strconv.ParseUint(num, 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("cannot parse %q (use e.g. 32GB, 16384MB, or plain bytes)", s)
+			}
+			return v * rs.mult, nil
+		}
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("cannot parse %q (use e.g. 32GB, 16384MB, or plain bytes)", s)
+	}
+	return v, nil
 }
 
 func collectDBStats(ctx context.Context, conn *pgx.Conn) (*DBStats, error) {
@@ -165,15 +294,7 @@ func readMemTotalKB() (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if strings.HasPrefix(line, "MemTotal:") {
-			f := strings.Fields(line)
-			if len(f) >= 2 {
-				return strconv.ParseUint(f[1], 10, 64)
-			}
-		}
-	}
-	return 0, fmt.Errorf("MemTotal not found in /proc/meminfo")
+	return memTotalFrom(string(b))
 }
 
 // detectDiskType resolves the block device that hosts the data directory and
@@ -219,7 +340,13 @@ func rotationalOf(name string) (int, bool) {
 	if err != nil {
 		return 0, false
 	}
-	switch strings.TrimSpace(string(b)) {
+	return rotationalFromContent(string(b))
+}
+
+// rotationalFromContent parses a /sys/block/<dev>/queue/rotational file
+// (0 = SSD, 1 = HDD).
+func rotationalFromContent(content string) (int, bool) {
+	switch strings.TrimSpace(content) {
 	case "0":
 		return 0, true
 	case "1":
@@ -235,15 +362,28 @@ func deviceForPath(path string) string {
 	if err != nil {
 		return ""
 	}
+	return deviceForPathFromMounts(path, string(mounts))
+}
+
+// deviceForPathFromMounts maps a path to its backing device name (e.g.
+// "nvme0n1") from /proc/mounts content. Returns "" when it cannot be resolved.
+func deviceForPathFromMounts(path, mountsContent string) string {
 	bestDev, bestLen := "", 0
-	for _, line := range strings.Split(string(mounts), "\n") {
+	for _, line := range strings.Split(mountsContent, "\n") {
 		f := strings.Fields(line)
 		if len(f) < 2 {
 			continue
 		}
 		dev, mnt := f[0], f[1]
-		if !strings.HasPrefix(path, mnt) || len(mnt) <= bestLen {
-			continue
+		// match on a component boundary ("/var/lib" must not claim
+		// "/var/libx"); the root mount "/" legitimately matches everything
+		if mnt != "/" {
+			if !strings.HasPrefix(path, mnt+"/") && path != mnt {
+				continue
+			}
+		}
+		if len(mnt) <= bestLen {
+			continue // longest mount wins
 		}
 		if !strings.HasPrefix(dev, "/dev/") {
 			continue // skip overlay, tmpfs, proc, ...
@@ -253,20 +393,65 @@ func deviceForPath(path string) string {
 	if bestDev == "" {
 		return ""
 	}
-	base := strings.TrimPrefix(bestDev, "/dev/")
-	// strip partitions: nvme0n1p1 -> nvme0n1, sda1 -> sda
+	return deviceName(bestDev)
+}
+
+// deviceName strips the /dev/ prefix and any partition suffix from a block
+// device path: /dev/sda1 -> sda, /dev/nvme0n1p1 -> nvme0n1,
+// /dev/mmcblk0p1 -> mmcblk0. Unrecognized shapes pass through unchanged
+// (the subsequent /sys/block lookup simply fails for them).
+func deviceName(dev string) string {
+	base := strings.TrimPrefix(dev, "/dev/")
 	if i := strings.IndexAny(base, "0123456789"); i > 0 {
 		stem := base[:i]
 		if strings.HasPrefix(stem, "sd") || strings.HasPrefix(stem, "vd") || strings.HasPrefix(stem, "xvd") {
 			return stem
 		}
-		if strings.HasPrefix(stem, "nvme") || strings.HasPrefix(stem, "mmc") {
-			// nvme0n1p1: cut before the trailing "pN" partition suffix
-			if j := strings.LastIndex(stem, "p"); j > 0 {
-				return stem[:j]
-			}
-			return stem
+	}
+	if strings.HasPrefix(base, "nvme") || strings.HasPrefix(base, "mmc") {
+		// nvme0n1p1 / mmcblk0p1: cut the trailing "pN" partition suffix
+		if i := strings.LastIndex(base, "p"); i > 0 && isDigits(base[i+1:]) {
+			return base[:i]
 		}
+		return base
 	}
 	return base
+}
+
+// isDigits reports whether s is non-empty and all decimal digits.
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// detectDiskTypeServer resolves the storage class from the server host itself
+// (via pg_read_file), so remote connections get the right ssd/hdd assumption.
+// Returns "" when the server-side files are unreadable (non-superuser) or the
+// data directory cannot be mapped to a device; callers fall back to the
+// client-side detection.
+func detectDiskTypeServer(ctx context.Context, conn *pgx.Conn, dataDir string) string {
+	mounts, err := serverFile(ctx, conn, "/proc/mounts")
+	if err != nil {
+		return ""
+	}
+	dev := deviceForPathFromMounts(dataDir, mounts)
+	if dev == "" {
+		return ""
+	}
+	if content, err := serverFile(ctx, conn, "/sys/block/"+dev+"/queue/rotational"); err == nil {
+		if r, ok := rotationalFromContent(content); ok {
+			if r == 0 {
+				return "ssd"
+			}
+			return "hdd"
+		}
+	}
+	return ""
 }

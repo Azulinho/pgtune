@@ -4,35 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
 
-// sudoPSQL runs statements as the postgres superuser via passwordless sudo.
-// db is the database to connect to ("" = default).
-func sudoPSQL(ctx context.Context, db string, stmts ...string) error {
-	args := []string{"-n", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-q"}
-	if db != "" {
-		args = append(args, "-d", db)
-	}
-	for _, s := range stmts {
-		args = append(args, "-c", s)
-	}
-	cmd := exec.CommandContext(ctx, "sudo", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("sudo -u postgres psql failed: %v\n%s", err, out)
-	}
-	return nil
-}
-
 // applyIndexes creates the indexes recommended by seq-scan findings. Only
 // selective predicates are applied (filter matches <= 10% of the table);
 // existing covering indexes are skipped. After creation it ANALYZEs the table
 // and re-runs EXPLAIN to verify the planner actually switched to the index.
-func applyIndexes(ctx context.Context, conn *pgx.Conn, opts Options, dbName string, qa *QueryAnalysis) error {
+// Creating an index requires table ownership (not superuser): when the
+// connected role cannot do it, the DDL is printed for manual execution.
+func applyIndexes(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis) error {
 	if qa == nil {
 		return nil
 	}
@@ -67,16 +50,13 @@ func applyIndexes(ctx context.Context, conn *pgx.Conn, opts Options, dbName stri
 		if writeHeavy := tableWriteHeavy(f, qa.Tables); writeHeavy {
 			fmt.Printf("warning: %s.%s is write-heavy - the new index adds per-row UPDATE/DELETE overhead\n", schema, table)
 		}
-		if !opts.UseSudo {
-			fmt.Printf("apply with -sudo (or run manually): %s\n", f.IndexDDL)
+		if _, err := conn.Exec(ctx, f.IndexDDL); err != nil {
+			fmt.Printf("warning: could not create index (run manually as a table owner):\n  %s\n  (%v)\n", f.IndexDDL, err)
 			continue
-		}
-		if err := sudoPSQL(ctx, dbName, f.IndexDDL); err != nil {
-			return fmt.Errorf("create index: %w", err)
 		}
 		fmt.Printf("created index on %s.%s (%s)\n", schema, table, col)
 		// refresh planner statistics so the new path is considered accurately
-		if err := sudoPSQL(ctx, dbName, fmt.Sprintf("ANALYZE %s.%s;", schema, table)); err != nil {
+		if _, err := conn.Exec(ctx, fmt.Sprintf("ANALYZE %s.%s;", schema, table)); err != nil {
 			fmt.Printf("warning: ANALYZE %s.%s failed: %v\n", schema, table, err)
 		}
 		if q := topQueryByID(qa, f.QueryID); q != nil {
@@ -226,9 +206,9 @@ func topQueryByID(qa *QueryAnalysis, id int64) *TopQuery {
 
 // applySettings pushes the changed settings to the server via ALTER SYSTEM and
 // reloads. ALTER SYSTEM requires superuser: when the connected role is not a
-// superuser it falls back to `sudo -u postgres psql`, or prints the statements
-// for manual execution. Returns the names of parameters needing a restart.
-func applySettings(ctx context.Context, conn *pgx.Conn, db *DBStats, plan []PlanItem, opts Options) ([]string, error) {
+// superuser, the statements are printed for manual execution instead. Returns
+// the names of parameters needing a restart.
+func applySettings(ctx context.Context, conn *pgx.Conn, db *DBStats, plan []PlanItem) ([]string, error) {
 	var changed []PlanItem
 	for _, it := range plan {
 		if it.Changed {
@@ -248,27 +228,21 @@ func applySettings(ctx context.Context, conn *pgx.Conn, db *DBStats, plan []Plan
 	}
 	stmts = append(stmts, "SELECT pg_reload_conf();")
 
-	switch {
-	case db.IsSuperuser:
-		for _, s := range stmts {
-			if _, err := conn.Exec(ctx, s); err != nil {
-				return nil, fmt.Errorf("exec %q: %w", s, err)
-			}
-		}
-		fmt.Println("Applied via superuser connection.")
-	case opts.UseSudo:
-		if err := sudoPSQL(ctx, "", stmts...); err != nil {
-			return nil, err
-		}
-		fmt.Println("Applied via sudo -u postgres psql.")
-	default:
-		fmt.Println("Connected user is not a superuser and sudo apply is disabled (-sudo=false).")
+	if !db.IsSuperuser {
+		fmt.Println("Connected user is not a superuser - ALTER SYSTEM requires superuser privileges.")
 		fmt.Println("Run the following as a superuser (e.g. sudo -u postgres psql):")
 		for _, s := range stmts {
 			fmt.Println("  " + s)
 		}
-		return nil, fmt.Errorf("cannot apply: not superuser and sudo apply disabled")
+		return nil, fmt.Errorf("cannot apply: not a superuser; run the printed SQL manually")
 	}
+
+	for _, s := range stmts {
+		if _, err := conn.Exec(ctx, s); err != nil {
+			return nil, fmt.Errorf("exec %q: %w", s, err)
+		}
+	}
+	fmt.Println("Applied via superuser connection.")
 
 	var restart []string
 	for _, it := range changed {
@@ -285,8 +259,11 @@ func applySettings(ctx context.Context, conn *pgx.Conn, db *DBStats, plan []Plan
 }
 
 // applyPgss bootstraps pg_stat_statements: creates the extension in the target
-// database and adds it to shared_preload_libraries. Returns restart reasons.
-func applyPgss(ctx context.Context, conn *pgx.Conn, opts Options, dbName string) ([]string, error) {
+// database and adds it to shared_preload_libraries. Both need superuser
+// privileges; when the connected role cannot read the current
+// shared_preload_libraries value, the statements are printed for manual
+// execution. Returns restart reasons.
+func applyPgss(ctx context.Context, conn *pgx.Conn) ([]string, error) {
 	avail, installed, preloaded, err := checkPgss(ctx, conn)
 	if err != nil {
 		return nil, err
@@ -303,14 +280,22 @@ func applyPgss(ctx context.Context, conn *pgx.Conn, opts Options, dbName string)
 
 	var restart []string
 	if !preloaded {
-		// The current shared_preload_libraries value is only readable as a
-		// superuser, so fetch it through sudo and merge pg_stat_statements in.
-		// preloaded (from view existence) is false whenever the extension is
-		// missing from THIS database, even if the library is already preloaded
-		// server-wide - so only a genuine preload change needs a restart.
-		cur, err := sudoShow(ctx, "SHOW shared_preload_libraries")
-		if err != nil {
-			return nil, err
+		// SHOW shared_preload_libraries is restricted to superusers (and
+		// pg_read_all_settings). preloaded (from view existence) is false
+		// whenever the extension is missing from THIS database, even if the
+		// library is already preloaded server-wide - so only a genuine preload
+		// change needs a restart.
+		var cur string
+		if err := conn.QueryRow(ctx, "SHOW shared_preload_libraries").Scan(&cur); err != nil {
+			msg := "cannot read shared_preload_libraries (needs superuser). Run manually as a superuser:\n" +
+				"  SHOW shared_preload_libraries; -- note the current value\n"
+			if !installed {
+				msg += "  CREATE EXTENSION pg_stat_statements;\n"
+			}
+			msg += "  ALTER SYSTEM SET shared_preload_libraries = '<current value>, pg_stat_statements';\n" +
+				"  SELECT pg_reload_conf();\n" +
+				"  -- then restart PostgreSQL once"
+			return nil, fmt.Errorf("%s", msg)
 		}
 		if !strings.Contains(cur, "pg_stat_statements") {
 			var parts []string
@@ -330,15 +315,19 @@ func applyPgss(ctx context.Context, conn *pgx.Conn, opts Options, dbName string)
 		fmt.Println("pg_stat_statements already configured.")
 		return nil, nil
 	}
-	if err := sudoPSQL(ctx, dbName, stmts...); err != nil {
-		return nil, err
+	for _, s := range stmts {
+		if _, err := conn.Exec(ctx, s); err != nil {
+			return nil, fmt.Errorf("exec %q: %w", s, err)
+		}
 	}
 	fmt.Println("Installed pg_stat_statements (extension + shared_preload_libraries).")
 	return restart, nil
 }
 
-// applyAnalyze runs ANALYZE when stale statistics were detected.
-func applyAnalyze(ctx context.Context, opts Options, dbName string, qa *QueryAnalysis) error {
+// applyAnalyze runs ANALYZE when stale statistics were detected. Plain ANALYZE
+// processes every table the connected role may analyze; a non-superuser only
+// covers their own tables, so failures are reported rather than fatal.
+func applyAnalyze(ctx context.Context, conn *pgx.Conn, opts Options, dbName string, qa *QueryAnalysis) error {
 	if qa == nil {
 		return nil
 	}
@@ -350,36 +339,22 @@ func applyAnalyze(ctx context.Context, opts Options, dbName string, qa *QueryAna
 		return nil
 	}
 	fmt.Printf("Running ANALYZE on database %s (stale statistics detected)...\n", dbName)
-	return sudoPSQL(ctx, dbName, "ANALYZE;")
-}
-
-// sudoShow runs a single statement as the postgres superuser and returns the
-// first column of the first row (used for settings that are not readable by
-// non-superusers).
-func sudoShow(ctx context.Context, sql string) (string, error) {
-	cmd := exec.CommandContext(ctx, "sudo", "-n", "-u", "postgres", "psql", "-tAc", sql)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("sudo %q: %v\n%s", sql, err, out)
+	if _, err := conn.Exec(ctx, "ANALYZE;"); err != nil {
+		return fmt.Errorf("ANALYZE: %w (run manually as a table owner or superuser)", err)
 	}
-	return strings.TrimSpace(string(out)), nil
+	return nil
 }
 
-// doRestart restarts PostgreSQL if required settings were changed and the
-// -restart flag is set; otherwise it tells the user how to restart.
-func doRestart(ctx context.Context, opts Options, reasons []string) error {
+// noteRestart reports settings that need a postmaster restart. The app never
+// restarts PostgreSQL itself; the operator does that with their platform's
+// service manager (systemctl, pg_ctlcluster, pg_ctl, ...).
+func noteRestart(reasons []string) {
 	if len(reasons) == 0 {
-		return nil
+		return
 	}
 	fmt.Printf("Settings requiring a restart: %s\n", strings.Join(reasons, ", "))
-	if !opts.Restart {
-		fmt.Println("Restart with: sudo systemctl restart postgresql  (or re-run with -restart)")
-		return nil
-	}
-	fmt.Println("Restarting PostgreSQL (sudo systemctl restart postgresql)...")
-	if out, err := exec.CommandContext(ctx, "sudo", "-n", "systemctl", "restart", "postgresql").CombinedOutput(); err != nil {
-		return fmt.Errorf("restart failed: %v\n%s", err, out)
-	}
-	fmt.Println("PostgreSQL restarted.")
-	return nil
+	fmt.Println("Restart PostgreSQL to apply them (the app does not restart the server), e.g.:")
+	fmt.Println("  sudo systemctl restart postgresql        # Debian/Ubuntu default cluster")
+	fmt.Println("  sudo systemctl restart postgresql-16     # RHEL/Fedora named cluster")
+	fmt.Println("  pg_ctlcluster 16 main restart            # Debian multi-cluster")
 }

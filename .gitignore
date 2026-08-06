@@ -1,1 +1,9 @@
+# build artifacts
 pgtune
+
+# editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store

@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"os"
+	"io"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -23,8 +23,8 @@ func humanDuration(sec float64) string {
 	}
 }
 
-func printReport(sys *SysStats, db *DBStats, wl Workload, plan []PlanItem, qa *QueryAnalysis) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+func printReport(out io.Writer, sys *SysStats, db *DBStats, wl Workload, plan []PlanItem, qa *QueryAnalysis) {
+	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 
 	fmt.Fprintln(w, "\n=== pgtune report ===")
 	fmt.Fprintln(w)
@@ -45,8 +45,8 @@ func printReport(sys *SysStats, db *DBStats, wl Workload, plan []PlanItem, qa *Q
 // printAllReport prints one instance-level view (aggregated live stats and the
 // tuning plan) followed by a per-database deep dive (query analysis, findings,
 // index recommendations) for every analyzable database.
-func printAllReport(sys *SysStats, agg *DBStats, wl Workload, plan []PlanItem, perDBs []*PerDB) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+func printAllReport(out io.Writer, sys *SysStats, agg *DBStats, wl Workload, plan []PlanItem, perDBs []*PerDB) {
+	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 
 	fmt.Fprintln(w, "\n=== pgtune report (all databases) ===")
 	fmt.Fprintln(w)

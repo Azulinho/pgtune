@@ -2,6 +2,10 @@
 
 Automatic PostgreSQL tuning for a single instance, plus pgbench load testing.
 
+Requirements: Linux (system stats come from `/proc` on the database host) and
+PostgreSQL 13 or newer (for `pg_stat_statements` column names; older servers
+report reduced query analysis).
+
 - **`pgtune`** — a Go CLI that connects to PostgreSQL, collects live statistics,
   analyzes the workload (slow queries, `pg_stat_statements`, `EXPLAIN ANALYZE`),
   computes a tuning plan, and applies it to the server configuration via
@@ -14,18 +18,37 @@ Automatic PostgreSQL tuning for a single instance, plus pgbench load testing.
 make build          # compile
 make tune-dry       # collect stats + show the tuning plan (changes nothing)
 make tune-restart   # full auto-tune: install pg_stat_statements, apply plan,
-                    # ANALYZE stale stats, restart once (first run only)
+                    # ANALYZE stale stats; restart postgres manually once
 make load           # generate workload, then re-run pgtune to see analysis
 ```
 
+> The `Makefile` targets below are local-development conveniences: they pin
+> `postgres/postgres` over TCP 127.0.0.1:5432 on this host. The `pgtune`
+> binary itself behaves like a local `psql`: it connects over the unix socket
+> as the current OS user (peer authentication, no password), reads standard
+> `PG*` environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`,
+> `PGDATABASE`, `PGSSLMODE`) when set, and has no default password - adjust
+> the variables for your platform. For a remote server use `-host`/`-port`
+> plus `-user`/`-password` (or the env vars).
+
 ## How it works
 
-1. **Connect** — as the configured role (default `postgres/postgres` direct on
-   port 5432, i.e. a superuser connection; pass `-port 6432 -user app -password
-   app -db app` to go through pgbouncer as the application role).
+1. **Connect** — like a local `psql`: unix socket, role = current OS user,
+   peer authentication (no password). Running the binary as the `postgres`
+   OS user is the exact equivalent of `sudo -u postgres psql`. For TCP or a
+   remote server: `-host`/`-port`/`-user`/`-password` or `PGHOST`/`PGPORT`/
+   `PGUSER`/`PGPASSWORD`. SSL mode defaults to `prefer` (ignored on sockets).
+   Pass `-port 5432 -user app -password app -db app` to run as the
+   application role.
 
 2. **Collect stats**
-   - System: RAM, CPU, disk type (SSD/HDD) from `/proc`.
+   - System: RAM, CPU, disk type (SSD/HDD) read from the **database server
+     host** via `pg_read_file` (`/proc/meminfo`, `/proc/cpuinfo`,
+     `/proc/mounts`) — the same file access a local postgres user's psql
+     session has, so tuning is correct even over a remote connection.
+     `pg_read_file` needs superuser; other roles fall back to the client
+     host's `/proc` (warned about when the connection is not local) — use
+     `-ram` to be explicit.
    - Server: `pg_stat_database` (hit ratio, commits, temp spill, deadlocks),
      `pg_stat_checkpointer`/`pg_stat_bgwriter` (checkpoint pressure),
      `pg_stat_user_tables` (seq vs index scans, dead tuples, last ANALYZE),
@@ -43,9 +66,11 @@ make load           # generate workload, then re-run pgtune to see analysis
      recommendation**), sorts spilling to disk / temp spills (→ work_mem),
      planner estimate skew (→ ANALYZE), table bloat, stale statistics
      (manual or auto ANALYZE older than 7 days), aggregate temp-file pressure
-     (e.g. 113GB spilled since stats reset), checkpoint pressure,
+     (e.g. tens of GB spilled since stats reset), checkpoint pressure,
      long-running queries. The app's own diagnostic queries and driver/framework
      setup statements are excluded from the pg_stat_statements top list.
+     SQL parsing (filter columns, `$n` placeholders, index definitions) is
+     best-effort: query shapes it does not recognize are skipped, never guessed.
    - Index recommendations: for a filtered seq scan on a plain column, the app
      emits `CREATE INDEX CONCURRENTLY` DDL, estimates selectivity with the
      histogram probe (skips predicates matching >10% of the table), skips
@@ -62,16 +87,17 @@ make load           # generate workload, then re-run pgtune to see analysis
    - autovacuum_vacuum_scale_factor tightened when dead-tuple bloat is found
 
 5. **Apply** — `ALTER SYSTEM SET ...` for changed parameters, then reload.
-   `ALTER SYSTEM` needs superuser: the app falls back to `sudo -u postgres psql`
-   (passwordless sudo on this host) or prints the SQL with `-sudo=false`.
-   Parameters with `postmaster` context (shared_buffers, wal_buffers,
-   shared_preload_libraries) require a restart; the app reports them and
-   restarts when given `-restart`.
+   `ALTER SYSTEM` needs a superuser connection: with a non-superuser role the
+   app prints the exact SQL for manual execution. Parameters with `postmaster`
+   context (shared_buffers, wal_buffers, shared_preload_libraries) require a
+   restart; the app reports which ones and how to restart on common platforms,
+   but never restarts the server itself.
 
 6. **pg_stat_statements bootstrap** — on first run the app creates the
-   extension and adds it to `shared_preload_libraries` (one restart), after
-   which every run reports real query statistics. `make tune-restart` does this
-   automatically; use `-install-pgss=false` to opt out.
+   extension and adds it to `shared_preload_libraries` (both need superuser;
+   one manual restart), after which every run reports real query statistics.
+   `make tune-restart` does this automatically; use `-install-pgss=false` to
+   opt out.
 
 ### pg_stat_statements: one server-wide library, per-database views
 
@@ -80,7 +106,7 @@ make load           # generate workload, then re-run pgtune to see analysis
 1. **The library** (`shared_preload_libraries = 'pg_stat_statements'`) is
    **server-wide**: it loads once at postmaster start and captures statement
    statistics in shared memory for every database on the cluster. This is the
-   part pgtune enables during bootstrap (`-apply -restart`, one restart).
+   part pgtune enables during bootstrap (`-apply`, one manual restart).
 2. **The extension** (`CREATE EXTENSION pg_stat_statements`) is
    **per-database**: it creates the `pg_stat_statements` view object in one
    specific database. The view has to be created separately in each database
@@ -112,21 +138,26 @@ plan, and it never downgrades memory parameters based on a lack of evidence
 
 ```
 pgtune [flags]
-  -host string          PostgreSQL host (default "127.0.0.1")
-  -port int             PostgreSQL port: 5432 direct / 6432 pgbouncer (default 5432)
-  -user string          (default "postgres")
-  -password string      (default "postgres")
-  -db string            database to analyze (default "postgres")
+  -host string          PostgreSQL host; PGHOST (default: local unix socket,
+                        like psql; a socket directory path also works)
+  -port int             PostgreSQL port; PGPORT (default 5432)
+  -user string          PostgreSQL user; PGUSER (default: current OS user,
+                        peer-authenticated over the socket, like psql)
+  -password string      PostgreSQL password; PGPASSWORD (default "")
+  -db string            database to analyze; PGDATABASE (default "postgres")
+  -sslmode string       SSL mode: disable | allow | prefer | require |
+                        verify-ca | verify-full; PGSSLMODE (default "prefer")
+  -ram string           total RAM override, e.g. 32GB (default: read from the
+                        database server's /proc/meminfo)
   -workload string      oltp | olap | mixed | desktop (default "oltp")
-  -apply                apply the plan (ALTER SYSTEM + reload)
+  -apply                apply the plan (ALTER SYSTEM + reload; needs superuser)
   -apply-index          create indexes recommended by seq-scan findings
                         (CONCURRENTLY; skips unselective & covered cases; verifies)
-  -restart              restart postgres via sudo systemctl if required
   -analyze              run ANALYZE when stale statistics are detected (apply mode)
-  -sudo                 allow sudo -u postgres fallback for apply (default true)
   -install-pgss         install pg_stat_statements when missing (default true)
   -top int              number of top queries from pg_stat_statements (default 8)
   -explain int          how many top queries to EXPLAIN, 0 disables (default 3)
+  -explain-timeout int  seconds allowed for EXPLAIN ANALYZE execution, 0 = no limit (default 5)
   -long-running float   flag queries running longer than this many seconds (default 5)
   -timeout int          seconds allowed per database operation (default 60)
   -tables int           number of largest tables to analyze (default 10)
@@ -137,13 +168,16 @@ pgtune [flags]
 Examples:
 
 ```bash
-./pgtune                                    # defaults: postgres/postgres@5432/postgres
-./pgtune -port 6432 -user app -password app -db app   # via pgbouncer as the app role
-./pgtune -workload olap -apply -restart -analyze   # full analytics auto-tune
-./pgtune -apply-index                             # create recommended indexes
-./pgtune -sudo=false                               # print SQL instead of applying
-./pgtune -explain 0                                # skip EXPLAIN (faster, read-only)
-./pgtune -all-dbs                                  # every database on the server
+./pgtune                                   # local socket as your OS user (like psql)
+PGPASSWORD=postgres ./pgtune -host 127.0.0.1 -user postgres   # TCP, postgres superuser
+./pgtune -password secret                  # password as a flag
+./pgtune -sslmode require                  # TLS to the server
+./pgtune -port 5432 -user app -password app -db app   # as the app role
+./pgtune -workload olap -apply -analyze    # full analytics auto-tune
+./pgtune -apply-index                      # create recommended indexes
+./pgtune -apply                            # non-superuser: prints the SQL to run
+./pgtune -explain 0                        # skip EXPLAIN (faster, read-only)
+./pgtune -all-dbs                          # every database on the server
 ```
 
 ## Multiple databases on one server
@@ -164,10 +198,10 @@ problems" while a second database recommends a new index.
 
 ### Permissions
 
-With the default `postgres` superuser login you see every database's
-statements, table stats and histograms with no extra setup - `make tune-all`
-just works. If you run as a non-superuser instead, note that since PostgreSQL
-15 a non-superuser can only see their *own* statements in
+With a `postgres` superuser connection (the Makefile default) you see every
+database's statements, table stats and histograms with no extra setup -
+`make tune-all` just works. If you run as a non-superuser instead, note that
+since PostgreSQL 15 a non-superuser can only see their *own* statements in
 `pg_stat_statements` and their own tables' `pg_stats` histograms, so a plain
 `app` user gets an incomplete picture of other databases. For the full
 cross-database view as a non-superuser, use a role with `pg_read_all_stats`
@@ -194,7 +228,7 @@ this automatically with `-apply`).
 make load                      # 20 clients / 8 threads / 60s (auto-inits schema)
 make load CLIENTS=100 DURATION=120
 make load-readonly             # SELECT-only
-make load PGPORT=6432 PGUSER=app PGPASSWORD=app PGDATABASE=app   # through pgbouncer
+make load PGPORT=5432 PGUSER=app PGPASSWORD=app PGDATABASE=app   # as the app role
 make load-custom F=my.sql
 ```
 
@@ -215,7 +249,7 @@ make load DURATION=30          # after
 | `queries.go` | pg_stat_statements, long-running queries, EXPLAIN analysis, findings |
 | `alldbs.go` | multi-database discovery, per-DB collection, instance aggregation |
 | `tune.go` | tuning formulas + evidence-based adjustments |
-| `apply.go` | ALTER SYSTEM / reload / pg_stat_statements install / ANALYZE / restart |
+| `apply.go` | ALTER SYSTEM / reload / pg_stat_statements install / ANALYZE |
 | `report.go` | terminal report rendering |
 | `*_test.go` | unit tests for plan math, EXPLAIN analysis, and DDL parsing (`make test`; no database needed) |
 | `Makefile` | build, tune, and load-test targets |

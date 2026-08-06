@@ -8,8 +8,9 @@
 #   make test           - run the unit tests
 #   make tune           - auto-tune: gather stats + apply tuning plan (as postgres superuser)
 #   make tune-index     - create indexes recommended by seq-scan findings
-#   make tune-restart   - full config tune incl. pg_stat_statements install + restart + ANALYZE
-#   make tune-full      - everything: tune + restart + ANALYZE + recommended indexes
+#   make tune-restart   - full config tune incl. pg_stat_statements install + ANALYZE
+#                         (restart PostgreSQL manually after the first run)
+#   make tune-full      - everything: tune + ANALYZE + recommended indexes (restart manually)
 #   make tune-dry       - gather stats and show the plan without applying
 #   make tune-olap      - same as tune but for an analytics workload
 #   make pgss-reset     - clear pg_stat_statements (run before a benchmark)
@@ -21,17 +22,23 @@
 
 # --- pgtune app ---
 GO      ?= go
-PGTUNE  := ./pgtune
+# The binary defaults to the local unix socket as your OS user (like psql);
+# the targets below pin the classic local-dev setup: postgres superuser over
+# TCP 127.0.0.1 with PGPASSWORD. (= defers $(PGUSER) expansion to recipe time)
+PGTUNE  = ./pgtune -host 127.0.0.1 -user $(PGUSER)
 WORKLOAD ?= oltp
 
 # --- load test (pgbench) ---
-# Defaults match the pgtune binary: postgres superuser, direct TCP (5432).
-# For pgbouncer / an app role: make load PGPORT=6432 PGUSER=app PGPASSWORD=app PGDATABASE=app
+# The Makefile pins these for both pgbench and pgtune: postgres superuser,
+# direct TCP (127.0.0.1). The pgtune binary itself defaults to the local
+# unix socket as the current OS user (peer auth), exactly like psql.
+# For an app role: make load PGPORT=5432 PGUSER=app PGPASSWORD=app PGDATABASE=app
 PGHOST    ?= 127.0.0.1
-PGPORT    ?= 5432          # postgres direct; pgbouncer is 6432
+PGPORT    ?= 5432
 PGUSER    ?= postgres
 PGPASSWORD?= postgres
 PGDATABASE?= postgres
+export PGPASSWORD
 
 CLIENTS   ?= 20
 THREADS   ?= 8
@@ -51,8 +58,8 @@ help:
 	@echo "  make test           run the unit tests (no database needed)"
 	@echo "  make tune           auto-tune postgres (stats + apply, workload=$(WORKLOAD))"
 	@echo "  make tune-index     create indexes recommended by seq-scan findings"
-	@echo "  make tune-restart   full config tune: pg_stat_statements + restart + ANALYZE"
-	@echo "  make tune-full      everything: tune + restart + ANALYZE + recommended indexes"
+	@echo "  make tune-restart   full config tune: pg_stat_statements + ANALYZE (restart postgres manually)"
+	@echo "  make tune-full      everything: tune + ANALYZE + recommended indexes (restart postgres manually)"
 	@echo "  make tune-dry       show stats and plan without applying"
 	@echo "  make tune-olap      auto-tune for an analytics workload"
 	@echo "  make tune-all       analyze every database on the server (per-DB recommendations)"
@@ -79,13 +86,15 @@ tune-index: build
 	$(PGTUNE) -apply-index
 
 ## Full auto-tune: install pg_stat_statements, apply plan, ANALYZE stale
-## statistics, restart once if required. Use this on a fresh instance.
+## statistics. Restart PostgreSQL manually once after the first run (the app
+## never restarts the server itself).
 tune-restart: build
-	$(PGTUNE) -apply -restart -analyze -workload $(WORKLOAD)
+	$(PGTUNE) -apply -analyze -workload $(WORKLOAD)
 
-## One-shot: config tune + restart if needed + ANALYZE + recommended indexes.
+## One-shot: config tune + ANALYZE + recommended indexes.
+## Restart PostgreSQL manually once if the plan requires it.
 tune-full: build
-	$(PGTUNE) -apply -restart -analyze -apply-index -workload $(WORKLOAD)
+	$(PGTUNE) -apply -analyze -apply-index -workload $(WORKLOAD)
 
 ## Show stats and tuning plan without changing anything.
 tune-dry: build
@@ -102,9 +111,10 @@ tune-olap: build
 tune-all: build
 	$(PGTUNE) -all-dbs -user $(PGUSER) -password $(PGPASSWORD) -port $(PGPORT)
 
-## Clear pg_stat_statements so query stats start from zero (needs sudo).
+## Clear pg_stat_statements so query stats start from zero (as the configured
+## superuser; requires pg_stat_statements preloaded).
 pgss-reset:
-	sudo -u postgres psql -d $(PGDATABASE) -c "SELECT pg_stat_statements_reset();"
+	PGPASSWORD=$(PGPASSWORD) psql -h $(PGHOST) -p $(PGPORT) -U $(PGUSER) -d $(PGDATABASE) -c "SELECT pg_stat_statements_reset();"
 
 ## Run the default TPC-B-like read/write workload.
 ## Initializes the schema first if the pgbench_accounts table is missing.

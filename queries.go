@@ -76,6 +76,17 @@ type QueryAnalysis struct {
 
 var dmlRe = regexp.MustCompile(`(?i)^\s*(insert|update|delete|merge|create|alter|drop|truncate|grant|revoke|copy|vacuum|analyze|call|do|reindex|cluster|refresh)\b`)
 
+const (
+	// findings thresholds (heuristics; see README "How it works")
+	staleStatsCutoff = 7 * 24 * time.Hour // ANALYZE older than this counts as stale
+	findingMinTable  = 8 * MiB            // tables below this size are not flagged
+	seqScanMinScans  = 10                 // at least this many seq scans to flag a table
+	seqScanRatio     = 10                 // seq scans must exceed idx scans by this factor
+	bloatDeadPct     = 0.25               // dead-tuple share that counts as bloat
+	bloatMinLive     = 1000               // tables with fewer live rows are ignored
+	tempSpillDBMin   = 10 * GiB           // cumulative temp spill worth reporting
+)
+
 // isStaleAnalyze reports whether a table's statistics are stale: the most
 // recent ANALYZE (manual or auto) is older than the cutoff, or the table was
 // never analyzed at all. A table that was only ever auto-analyzed is NOT stale
@@ -252,8 +263,9 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options, db 
 	}
 
 	// derive table-level findings
+	now := time.Now()
 	for _, t := range qa.Tables {
-		if t.SizeBytes > int64(8*MiB) && t.SeqScan > 10 && t.SeqScan > 10*max(t.IdxScan, 1) {
+		if t.SizeBytes > int64(findingMinTable) && t.SeqScan > seqScanMinScans && t.SeqScan > seqScanRatio*max(t.IdxScan, 1) {
 			qa.Findings = append(qa.Findings, Finding{
 				Kind:  "table-seq-scan",
 				Table: t.Schema + "." + t.Table,
@@ -262,7 +274,7 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options, db 
 				Suggestion: "an index on the columns used by common WHERE filters would cut I/O dramatically",
 			})
 		}
-		if t.DeadPct > 0.25 && t.Live > 1000 {
+		if t.DeadPct > bloatDeadPct && t.Live > bloatMinLive {
 			qa.Findings = append(qa.Findings, Finding{
 				Kind:  "bloat",
 				Table: t.Schema + "." + t.Table,
@@ -271,8 +283,8 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options, db 
 				Suggestion: "check autovacuum (more workers / lower scale factor) or run VACUUM",
 			})
 		}
-		stale := isStaleAnalyze(t.LastAnalyze, t.LastAutoAnalyze, time.Now(), 7*24*time.Hour)
-		if stale && t.SizeBytes > int64(8*MiB) {
+		stale := isStaleAnalyze(t.LastAnalyze, t.LastAutoAnalyze, now, staleStatsCutoff)
+		if stale && t.SizeBytes > int64(findingMinTable) {
 			qa.Findings = append(qa.Findings, Finding{
 				Kind:  "stale-stats",
 				Table: t.Schema + "." + t.Table,
@@ -286,7 +298,7 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options, db 
 	// aggregate temp-file pressure that per-query EXPLAINs cannot see (the
 	// top queries are parameterized and only get a non-executing EXPLAIN).
 	// Cumulative since the last stats reset - advisory, not per-sort evidence.
-	if db != nil && db.TempBytes > int64(10*GiB) {
+	if db != nil && db.TempBytes > int64(tempSpillDBMin) {
 		qa.Findings = append(qa.Findings, Finding{
 			Kind:       "temp-spill-db",
 			Detail:     fmt.Sprintf("%d temp file(s), %s total spilled to disk since stats reset", db.TempFiles, fmtBytes(uint64(db.TempBytes))),
@@ -295,7 +307,7 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options, db 
 	}
 
 	// EXPLAIN ANALYZE / GENERIC_PLAN on the most expensive eligible queries.
-	if err := explainTopQueries(ctx, conn, qa, opts.ExplainN); err != nil {
+	if err := explainTopQueries(ctx, conn, qa, opts); err != nil {
 		return nil, err
 	}
 
@@ -308,13 +320,13 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options, db 
 // skipped (EXPLAIN ANALYZE would execute it). A context deadline (per-DB
 // budget exhausted) is returned as an error so the caller records the
 // database as skipped; all other failures stay explain-error findings.
-func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, explainN int) error {
-	if conn == nil || explainN <= 0 {
+func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, opts Options) error {
+	if conn == nil || opts.ExplainN <= 0 {
 		return nil
 	}
 	done := 0
 	for i := range qa.Top {
-		if done >= explainN {
+		if done >= opts.ExplainN {
 			break
 		}
 		q := &qa.Top[i]
@@ -366,13 +378,20 @@ func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, e
 				continue
 			}
 		} else {
-			if _, err := conn.Exec(ctx, "SET statement_timeout = 5000"); err != nil {
-				if errors.Is(err, context.DeadlineExceeded) {
-					return err
-				}
-				continue
+			// EXPLAIN ANALYZE executes the query for real, so cap it with a
+			// statement_timeout scoped to a transaction (SET LOCAL): it cannot
+			// leak into later statements on the shared connection, and it is
+			// reliable under connection pooling. 0 disables the cap.
+			tx, err := conn.Begin(ctx)
+			if err != nil {
+				return err
 			}
-			if err := conn.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+sql).Scan(&out); err != nil {
+			if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", opts.ExplainTimeout.Milliseconds())); err != nil {
+				_ = tx.Rollback(ctx)
+				return err
+			}
+			if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+sql).Scan(&out); err != nil {
+				_ = tx.Rollback(ctx)
 				if errors.Is(err, context.DeadlineExceeded) {
 					return err
 				}
@@ -384,6 +403,9 @@ func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, e
 				})
 				done++
 				continue
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return err
 			}
 		}
 
