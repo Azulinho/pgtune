@@ -15,6 +15,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// version is stamped at build time via -ldflags "-X main.version=...";
+// local builds report "dev".
+var version = "dev"
+
 type Options struct {
 	Host           string
 	Port           int
@@ -92,7 +96,14 @@ func main() {
 	flag.BoolVar(&opts.Analyze, "analyze", false, "Run ANALYZE when stale statistics are detected (apply mode)")
 	flag.BoolVar(&opts.ApplyIndex, "apply-index", false, "Create indexes recommended by seq-scan findings (CONCURRENTLY, skips unselective ones)")
 	flag.BoolVar(&opts.AllDBs, "all-dbs", false, "Analyze every database on the server (per-database recommendations)")
+	var showVersion bool
+	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.Parse()
+
+	if showVersion {
+		fmt.Printf("pgtune %s\n", version)
+		os.Exit(0)
+	}
 
 	opts.Timeout = time.Duration(timeoutSec) * time.Second
 	opts.ExplainTimeout = time.Duration(explainTimeoutSec) * time.Second
