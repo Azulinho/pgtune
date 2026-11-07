@@ -274,8 +274,9 @@ pgtune uses `pg_stat_statements`. If it is missing, pgtune installs it.
 
 - It lists the slowest queries by total time, with call counts and average
   latency.
-- It runs `EXPLAIN (ANALYZE, BUFFERS)` on the most expensive SELECTs. These are
-  real runs, so they cost time. DML is never executed.
+- It runs `EXPLAIN (ANALYZE, BUFFERS)` only on statements the connected role
+  ran. Statements from other roles get a plain `EXPLAIN` and are never
+  executed. `FOR UPDATE`/`FOR SHARE` statements are never executed either.
 - Queries with parameters get a plain `EXPLAIN`, using sample values from
   `pg_stats` so the planner estimate is realistic.
 - It reports things like full table scans with filters, sorts spilling to disk,

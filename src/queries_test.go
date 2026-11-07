@@ -326,3 +326,33 @@ func TestWalkPlanFromRealExplainJSON(t *testing.T) {
 		t.Errorf("EstRows = %d, want 2161", findings[0].EstRows)
 	}
 }
+
+func TestExplainModeFor(t *testing.T) {
+	const me, other = int64(10), int64(20)
+	cases := []struct {
+		name string
+		q    TopQuery
+		user int64
+		want ExplainMode
+	}{
+		{"owned select", TopQuery{UserID: me, Query: "SELECT 1"}, me, ExplainAnalyze},
+		{"other role select", TopQuery{UserID: other, Query: "SELECT 1"}, me, ExplainPlanOnly},
+		{"unknown current role", TopQuery{UserID: other, Query: "SELECT 1"}, 0, ExplainPlanOnly},
+		{"owned cte", TopQuery{UserID: me, Query: "WITH x AS (SELECT 1) SELECT * FROM x"}, me, ExplainAnalyze},
+		{"owned for update", TopQuery{UserID: me, Query: "SELECT * FROM t FOR UPDATE"}, me, ExplainPlanOnly},
+		{"owned for share", TopQuery{UserID: me, Query: "SELECT * FROM t FOR SHARE"}, me, ExplainPlanOnly},
+		{"owned for no key update", TopQuery{UserID: me, Query: "SELECT * FROM t FOR NO KEY UPDATE"}, me, ExplainPlanOnly},
+		{"owned for key share", TopQuery{UserID: me, Query: "SELECT * FROM t FOR KEY SHARE"}, me, ExplainPlanOnly},
+		{"insert", TopQuery{UserID: me, Query: "INSERT INTO t VALUES (1)"}, me, ExplainSkip},
+		{"update", TopQuery{UserID: me, Query: "UPDATE t SET a = 1"}, me, ExplainSkip},
+		{"show", TopQuery{UserID: me, Query: "SHOW work_mem"}, me, ExplainSkip},
+		{"empty", TopQuery{UserID: me, Query: "  ; "}, me, ExplainSkip},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := explainModeFor(c.q, c.user); got != c.want {
+				t.Errorf("explainModeFor(%q, %d) = %v, want %v", c.q.Query, c.user, got, c.want)
+			}
+		})
+	}
+}

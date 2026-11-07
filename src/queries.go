@@ -15,6 +15,7 @@ import (
 
 // TopQuery is one entry from pg_stat_statements.
 type TopQuery struct {
+	UserID    int64
 	QueryID   int64
 	Calls     int64
 	TotalMS   float64
@@ -22,6 +23,39 @@ type TopQuery struct {
 	Rows      int64
 	Query     string
 	HasParams bool
+}
+
+// ExplainMode says how a captured statement may be explored.
+type ExplainMode int
+
+const (
+	ExplainSkip ExplainMode = iota
+	ExplainPlanOnly
+	ExplainAnalyze
+)
+
+var lockingClauseRe = regexp.MustCompile(`(?i)\bfor\s+(?:(?:no\s+)?key\s+)?(?:update|share)\b`)
+
+// explainModeFor decides how a captured statement may be explored. Only
+// statements run by the connected role are executed; everything else gets a
+// plan-only EXPLAIN. DML and non-SELECT statements are skipped, and locking
+// clauses are never executed, regardless of ownership.
+func explainModeFor(q TopQuery, currentUserID int64) ExplainMode {
+	sql := strings.TrimRight(strings.TrimSpace(q.Query), "; \t\n")
+	if sql == "" || dmlRe.MatchString(sql) {
+		return ExplainSkip
+	}
+	low := strings.ToLower(sql)
+	if !(strings.HasPrefix(low, "select") || strings.HasPrefix(low, "with")) {
+		return ExplainSkip
+	}
+	if lockingClauseRe.MatchString(sql) {
+		return ExplainPlanOnly
+	}
+	if currentUserID == 0 || q.UserID != currentUserID {
+		return ExplainPlanOnly
+	}
+	return ExplainAnalyze
 }
 
 // LongRunning is a query currently running longer than the threshold.
@@ -171,8 +205,16 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options, db 
 		return qa, nil
 	}
 
+	// The connected role's OID decides which statements may be executed under
+	// EXPLAIN ANALYZE. If it cannot be read, 0 keeps every statement plan-only.
+	var currentUserID int64
+	if err := conn.QueryRow(ctx,
+		`SELECT oid::bigint FROM pg_roles WHERE rolname = current_user`).Scan(&currentUserID); err != nil {
+		currentUserID = 0
+	}
+
 	rows, err := conn.Query(ctx, `
-		SELECT COALESCE(s.queryid,0), s.calls, s.total_exec_time, s.mean_exec_time, s.rows, s.query
+		SELECT COALESCE(s.userid,0)::bigint, COALESCE(s.queryid,0), s.calls, s.total_exec_time, s.mean_exec_time, s.rows, s.query
 		FROM pg_stat_statements s
 		JOIN pg_database d ON d.oid = s.dbid
 		WHERE d.datname = current_database()
@@ -186,7 +228,7 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options, db 
 	}
 	for rows.Next() {
 		var t TopQuery
-		if err := rows.Scan(&t.QueryID, &t.Calls, &t.TotalMS, &t.MeanMS, &t.Rows, &t.Query); err != nil {
+		if err := rows.Scan(&t.UserID, &t.QueryID, &t.Calls, &t.TotalMS, &t.MeanMS, &t.Rows, &t.Query); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -306,55 +348,63 @@ func collectQueryAnalysis(ctx context.Context, conn *pgx.Conn, opts Options, db 
 		})
 	}
 
-	// EXPLAIN ANALYZE / GENERIC_PLAN on the most expensive eligible queries.
-	if err := explainTopQueries(ctx, conn, qa, opts); err != nil {
+	// EXPLAIN ANALYZE / plan-only EXPLAIN on the most expensive eligible queries.
+	if err := explainTopQueries(ctx, conn, qa, opts, currentUserID); err != nil {
 		return nil, err
 	}
 
 	return qa, nil
 }
 
-// explainTopQueries runs EXPLAIN on the top queries. SELECT-only queries are
-// safe to ANALYZE; parameterized ones get a plain EXPLAIN (no execution) with
-// bound values so the planner estimates selectivity realistically. DML is
-// skipped (EXPLAIN ANALYZE would execute it). A context deadline (per-DB
-// budget exhausted) is returned as an error so the caller records the
-// database as skipped; all other failures stay explain-error findings.
-func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, opts Options) error {
+// explainTopQueries runs EXPLAIN on the top queries. Only statements run by
+// the connected role are executed with EXPLAIN ANALYZE; statements from other
+// roles, and any locking clause, get a plain EXPLAIN that never executes the
+// query. Parameterized statements also get a plain EXPLAIN with probe values,
+// because executing them with dummy values would misrepresent the workload.
+// DML is skipped. A context deadline (per-DB budget exhausted) is returned as
+// an error so the caller records the database as skipped; all other failures
+// stay explain-error findings.
+func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, opts Options, currentUserID int64) error {
 	if conn == nil || opts.ExplainN <= 0 {
 		return nil
 	}
 	done := 0
+	planOnly := 0
 	for i := range qa.Top {
 		if done >= opts.ExplainN {
 			break
 		}
 		q := &qa.Top[i]
 		sql := strings.TrimRight(strings.TrimSpace(q.Query), "; \t\n")
-		if dmlRe.MatchString(sql) {
+		mode := explainModeFor(*q, currentUserID)
+		if mode == ExplainSkip {
 			continue
 		}
-		low := strings.ToLower(sql)
-		if !(strings.HasPrefix(low, "select") || strings.HasPrefix(low, "with")) {
-			continue
+		if mode == ExplainPlanOnly {
+			planOnly++
 		}
 
 		var out string
-		if q.HasParams {
-			// plain EXPLAIN (not ANALYZE, not GENERIC_PLAN): no execution, but
-			// the planner uses the bound values, giving realistic row estimates
-			// (GENERIC_PLAN would assume ~1/3 selectivity for every predicate).
-			// Probe values are derived from pg_stats histograms when the WHERE
-			// clause targets a plain column; otherwise dummy 1 is bound.
-			args := make([]any, countParams(sql))
-			for i := range args {
-				args[i] = 1
-			}
-			probe, probed := probeValues(ctx, conn, sql)
-			if probed {
-				for k, v := range probe {
-					if k >= 1 && k <= len(args) {
-						args[k-1] = v
+		if mode == ExplainPlanOnly || q.HasParams {
+			// Plain EXPLAIN (not ANALYZE, not GENERIC_PLAN): no execution, but
+			// the planner uses bound values, giving realistic row estimates
+			// (GENERIC_PLAN assumes ~1/3 selectivity for every predicate).
+			// Probe values come from pg_stats histograms when the WHERE clause
+			// targets a plain column; otherwise dummy 1 is bound.
+			args := make([]any, 0)
+			probed := false
+			if q.HasParams {
+				args = make([]any, countParams(sql))
+				for i := range args {
+					args[i] = 1
+				}
+				var probe map[int]any
+				probe, probed = probeValues(ctx, conn, sql)
+				if probed {
+					for k, v := range probe {
+						if k >= 1 && k <= len(args) {
+							args[k-1] = v
+						}
 					}
 				}
 			}
@@ -417,6 +467,14 @@ func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, o
 			qa.Findings = append(qa.Findings, walkPlan(e.Plan, *q)...)
 		}
 		done++
+	}
+	if planOnly > 0 {
+		note := fmt.Sprintf("%d statement(s) from other roles were planned only (never executed as the connected role)", planOnly)
+		if qa.Note != "" {
+			qa.Note += "; " + note
+		} else {
+			qa.Note = note
+		}
 	}
 	return nil
 }
