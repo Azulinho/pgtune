@@ -488,7 +488,7 @@ benchmark, so the stats start from zero.
 | `src/apply.go` | ALTER SYSTEM, reload, pg_stat_statements install, ANALYZE |
 | `src/report.go` | Terminal report |
 | `src/*_test.go` | Unit tests for plan math, EXPLAIN and DDL parsing |
-| `go.mod`, `go.sum` | Go module definition and dependencies |
+| `src/go.mod`, `src/go.sum` | Go module definition and dependencies |
 | `Makefile` | Development build, tune and load-test targets |
 | `README.md` | This file |
 

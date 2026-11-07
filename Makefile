@@ -70,11 +70,11 @@ help:
 
 ## Compile the pgtune binary.
 build:
-	$(GO) build -o pgtune ./src
+	cd src && $(GO) build -o ../pgtune .
 
 ## Run the unit tests (pure logic: plan math, EXPLAIN analysis, DDL parsing).
 test:
-	$(GO) test -count=1 ./...
+	cd src && $(GO) test -count=1 ./...
 
 ## Auto-tune: gather stats, apply plan, reload (restarts only if required).
 tune: build

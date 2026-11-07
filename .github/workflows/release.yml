@@ -28,7 +28,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version-file: src/go.mod
 
       - name: determine version
         id: meta
@@ -75,9 +75,12 @@ jobs:
             goos=$1
             goarch=$2
             name="pgtune-${VERSION}-${goos}-${goarch}"
-            GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 go build -trimpath \
-              -ldflags "-s -w -X main.version=${VERSION#v}" \
-              -o "dist/${name}" ./src
+            (
+              cd src
+              GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 go build -trimpath \
+                -ldflags "-s -w -X main.version=${VERSION#v}" \
+                -o "../dist/${name}" .
+            )
             (cd dist && sha256sum "${name}" >> checksums.txt)
           done
 
