@@ -4,7 +4,7 @@ Automatic PostgreSQL tuning for a single instance, plus pgbench load testing.
 
 Requirements: Linux (system stats come from `/proc` on the database host) and
 PostgreSQL 13 or newer (for `pg_stat_statements` column names; older servers
-report reduced query analysis).
+report reduced query analysis). macOS and Windows are not supported.
 
 - **`pgtune`** — a Go CLI that connects to PostgreSQL, collects live statistics,
   analyzes the workload (slow queries, `pg_stat_statements`, `EXPLAIN ANALYZE`),
@@ -34,7 +34,7 @@ make load           # generate workload, then re-run pgtune to see analysis
 ## Packages
 
 Release tags publish `.deb` and `.rpm` packages for `amd64`/`x86_64` and
-`arm64`/`aarch64` alongside the raw binaries on the
+`arm64`/`aarch64`, plus raw `linux/amd64` and `linux/arm64` binaries, on the
 [Releases](https://github.com/Azulinho/pgtune/releases) page:
 
 ```bash
