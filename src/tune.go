@@ -234,7 +234,10 @@ func buildPlan(sys *SysStats, db *DBStats, wl Workload, qa *QueryAnalysis) []Pla
 				}
 			}
 			needed := maxSort + curWorkMem // in-memory portion + what spilled
-			hardCap := (ram - shared - mwm) / uint64(maxConn+int(avWorkers))
+			hardCap := uint64(0)
+			if ram > shared+mwm {
+				hardCap = (ram - shared - mwm) / uint64(maxConn+int(avWorkers))
+			}
 			if hardCap > 64*MiB {
 				hardCap = 64 * MiB
 			}

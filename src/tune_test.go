@@ -471,3 +471,15 @@ func TestCurrentDisplay(t *testing.T) {
 		t.Errorf("currentDisplay(float) = %q, want 1.1", got)
 	}
 }
+
+func TestBuildPlanTinyRAMSpillDoesNotOvercommit(t *testing.T) {
+	sys := &SysStats{TotalMemBytes: 128 * MiB, NumCPU: 2, DiskType: "ssd"}
+	db := mkDB(mkSetting("work_mem", "4096", "kB", "user"))
+	qa := &QueryAnalysis{Findings: []Finding{{Kind: "temp-spill", Bytes: 1 * GiB}}}
+	plan := buildPlan(sys, db, WorkloadOLTP, qa)
+
+	it := planItem(t, plan, "work_mem")
+	if it.Proposed != "16MB" {
+		t.Errorf("work_mem proposed = %q, want 16MB when RAM leaves no spare budget", it.Proposed)
+	}
+}

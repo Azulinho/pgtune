@@ -6,7 +6,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"net/url"
 	"os"
 	"os/user"
 	"strconv"
@@ -59,6 +58,14 @@ func envPort(key string, def int) int {
 		}
 	}
 	return def
+}
+
+// opContext applies an operation budget; d <= 0 means no deadline.
+func opContext(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, d)
 }
 
 // defaultUser mirrors psql: the connecting role defaults to the current OS
@@ -123,8 +130,7 @@ func main() {
 
 	ctx := context.Background()
 
-	dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
-		url.QueryEscape(opts.User), url.QueryEscape(opts.Password), opts.Host, opts.Port, url.QueryEscape(opts.DB), opts.SslMode)
+	dsn := dsnFor(opts, opts.DB)
 
 	cctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	conn, err := pgx.Connect(cctx, dsn)
@@ -139,28 +145,30 @@ func main() {
 		conn.Close(cctx)
 	}()
 
-	dctx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	dctx, cancel := opContext(ctx, opts.Timeout)
 	sys, err := collectSysStats(dctx, conn, opts)
+	cancel()
 	if err != nil {
-		cancel()
 		fmt.Fprintf(os.Stderr, "error: system stats: %v\n", timeoutReason(opts, err))
 		os.Exit(1)
 	}
+
+	dctx, cancel = opContext(ctx, opts.Timeout)
 	db, err := collectDBStats(dctx, conn)
+	cancel()
 	if err != nil {
-		cancel()
 		fmt.Fprintf(os.Stderr, "error: database stats: %v\n", timeoutReason(opts, err))
 		os.Exit(1)
 	}
 
 	wl, err := parseWorkload(opts.Workload)
 	if err != nil {
-		cancel()
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	qa, err := collectQueryAnalysis(dctx, conn, opts, db)
+	qctx, cancel := opContext(ctx, opts.Timeout)
+	qa, err := collectQueryAnalysis(qctx, conn, opts, db)
 	cancel()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: query analysis: %v\n", timeoutReason(opts, err))

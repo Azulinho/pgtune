@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"sort"
 	"strings"
 
@@ -21,8 +20,7 @@ type PerDB struct {
 
 // dsnFor builds a connection string for the given database.
 func dsnFor(opts Options, db string) string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
-		url.QueryEscape(opts.User), url.QueryEscape(opts.Password), opts.Host, opts.Port, url.QueryEscape(db), opts.SslMode)
+	return buildDSN(opts, db)
 }
 
 // listDatabases returns the names of non-template, connectable databases.
