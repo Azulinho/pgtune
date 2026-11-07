@@ -1,0 +1,43 @@
+# nFPM configuration for the pgtune .deb and .rpm packages.
+#
+# Build from the repository root after staging the target binary at
+# dist/pkgroot/pgtune:
+#
+#   ARCH=amd64 VERSION=0.202608.2 \
+#     nfpm package -f packaging/nfpm.yaml -p deb \
+#       -t dist/pgtune_0.202608.2-1_amd64.deb
+#   ARCH=amd64 VERSION=0.202608.2 \
+#     nfpm package -f packaging/nfpm.yaml -p rpm \
+#       -t dist/pgtune-0.202608.2-1.x86_64.rpm
+#
+# VERSION and ARCH are expanded from the environment. ARCH uses Go names
+# (amd64, arm64); nFPM translates them to the package-specific names
+# (x86_64, aarch64) for RPM automatically.
+
+name: pgtune
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+# Tags are date-based (for example 0.202608.2); do not try to re-parse them
+# as semver.
+version_schema: none
+release: "1"
+section: database
+priority: optional
+maintainer: Azulinho <git@azulinho.com>
+vendor: pgtune contributors
+homepage: https://github.com/Azulinho/pgtune
+license: GPL-3.0-or-later
+description: |
+  Automatic PostgreSQL tuning for a single instance.
+
+  pgtune connects to PostgreSQL, collects live statistics, analyzes the
+  workload, computes a tuning plan, and applies it to the server
+  configuration via ALTER SYSTEM and pg_reload_conf().
+contents:
+  - src: ./dist/pkgroot/pgtune
+    dst: /usr/bin/pgtune
+  - src: ./README.md
+    dst: /usr/share/doc/pgtune/README.md
+  - src: ./LICENSE
+    dst: /usr/share/doc/pgtune/LICENSE

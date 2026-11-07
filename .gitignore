@@ -1,5 +1,6 @@
 # build artifacts
 pgtune
+dist/
 
 # editor / OS noise
 .vscode/

@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - "**"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version (default: 0.0.0~snapshot.<run>)"
+        required: false
+      publish:
+        description: "Create/update the GitHub release"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -18,11 +28,41 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: build
+      - name: determine version
+        id: meta
         env:
-          VERSION: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_PUBLISH: ${{ github.event.inputs.publish }}
         run: |
           set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] &&
+             [ "${INPUT_PUBLISH}" = "true" ] &&
+             [ -z "${INPUT_VERSION}" ]; then
+            echo "::error::publish=true requires the version input"
+            exit 1
+          fi
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+          elif [ -n "${INPUT_VERSION}" ]; then
+            tag="${INPUT_VERSION}"
+            version="${INPUT_VERSION#v}"
+          else
+            tag=""
+            # Valid in both Debian and RPM version fields.
+            version="0.0.0~snapshot.${GITHUB_RUN_NUMBER}"
+          fi
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: build binaries
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf dist
           mkdir -p dist
           for target in \
             "linux amd64" \
@@ -42,11 +82,68 @@ jobs:
             (cd dist && sha256sum "${name}${ext}" >> checksums.txt)
           done
 
+      - name: install nfpm
+        run: |
+          set -euo pipefail
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.46.0
+          echo "$(go env GOPATH)/bin" >> "${GITHUB_PATH}"
+
+      - name: build packages
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/pkgroot
+          for arch in amd64 arm64; do
+            case "${arch}" in
+              amd64) rpmarch=x86_64 ;;
+              arm64) rpmarch=aarch64 ;;
+            esac
+            install -m 0755 "dist/pgtune-${VERSION}-linux-${arch}" dist/pkgroot/pgtune
+            ARCH="${arch}" nfpm package \
+              --config packaging/nfpm.yaml \
+              --packager deb \
+              --target "dist/pgtune_${VERSION}-1_${arch}.deb"
+            ARCH="${arch}" nfpm package \
+              --config packaging/nfpm.yaml \
+              --packager rpm \
+              --target "dist/pgtune-${VERSION}-1.${rpmarch}.rpm"
+          done
+          (cd dist && sha256sum pgtune_*.deb pgtune-*.rpm >> checksums.txt)
+          rm -rf dist/pkgroot
+
+      - name: upload build artifacts
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish != 'true')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pgtune-${{ steps.meta.outputs.version }}
+          path: |
+            dist/pgtune-*
+            dist/*.deb
+            dist/*.rpm
+            dist/checksums.txt
+          if-no-files-found: error
+
       - name: publish
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+          set -euo pipefail
+          release_tag="${TAG:-${VERSION}}"
+          if gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${release_tag}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+          elif [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            gh release create "${release_tag}" dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${release_tag}" \
+              --generate-notes
+          else
+            gh release create "${release_tag}" dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "${release_tag}" \
+              --generate-notes
+          fi

@@ -31,6 +31,23 @@ make load           # generate workload, then re-run pgtune to see analysis
 > the variables for your platform. For a remote server use `-host`/`-port`
 > plus `-user`/`-password` (or the env vars).
 
+## Packages
+
+Release tags publish `.deb` and `.rpm` packages for `amd64`/`x86_64` and
+`arm64`/`aarch64` alongside the raw binaries on the
+[Releases](https://github.com/Azulinho/pgtune/releases) page:
+
+```bash
+# Debian / Ubuntu
+sudo dpkg -i pgtune_<version>-1_amd64.deb
+
+# RHEL / Fedora / openSUSE
+sudo rpm -U pgtune-<version>-1.x86_64.rpm
+```
+
+The packages install the static binary to `/usr/bin/pgtune` and the docs to
+`/usr/share/doc/pgtune/`.
+
 ## How it works
 
 1. **Connect** — like a local `psql`: unix socket, role = current OS user,
