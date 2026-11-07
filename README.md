@@ -3,14 +3,17 @@
 pgtune tunes a PostgreSQL server for you, and can also load-test it with
 pgbench.
 
-It connects to your database, looks at what is really happening, and works out
-a set of settings. If you ask it to, it applies those settings for you.
+It runs on the database server itself. It connects over the local unix socket,
+looks at what is really happening, and works out a set of settings. If you ask
+it to, it applies those settings for you.
 
 pgtune never restarts PostgreSQL. If a change needs a restart, it tells you and
 you do it yourself. You can run it by hand, from cron, or from a systemd timer.
 
 ## Requirements
 
+- Run pgtune on the same machine as PostgreSQL. It is meant for a local
+  database, not a remote one.
 - Linux. pgtune reads system details from `/proc` on the database host.
 - PostgreSQL 13 or newer. Older servers work, but you get less query analysis.
 - macOS and Windows are not supported.
@@ -131,13 +134,13 @@ doing.
 | How | Use it for | Connection |
 |---|---|---|
 | `make <target>` | Development in this repository | Fixed to `postgres/postgres` over TCP 127.0.0.1:5432 |
-| `pgtune <flags>` | Real servers, cron and systemd timers | Unix socket as your OS user, or `PG*` variables and flags |
+| `pgtune <flags>` | Local databases, cron and systemd timers | Local unix socket as your OS user |
 
 The `make` targets are a convenience for working on this project. They are not
 for production.
 
-The installed binary is the tool you run on a server. It works like `psql` and
-is safe to run on a schedule.
+The installed binary is the tool you run on the database server. It works like
+`psql` and is safe to run on a schedule. It is built for a local database.
 
 ## Development: the make targets
 
@@ -158,10 +161,10 @@ them only for local development.
 `make tune-restart` needs one manual restart of PostgreSQL the first time. That
 is because `pg_stat_statements` is loaded at server start.
 
-## On a server: run pgtune directly
+## On the database server: run pgtune directly
 
-After you install the package, run `pgtune` itself. Do not use the Makefile on
-a server.
+After you install the package, run `pgtune` itself on the database server. Do
+not use the Makefile on a server.
 
 ```bash
 sudo -u postgres pgtune                      # show the plan, change nothing
@@ -169,14 +172,18 @@ sudo -u postgres pgtune -apply -analyze      # apply the plan and ANALYZE
 sudo -u postgres pgtune -all-dbs -apply      # every database
 ```
 
-By default pgtune uses the unix socket and connects as your current OS user.
-There is no password. This is the same as a local `psql`.
+pgtune connects through the local unix socket as your current OS user. There
+is no password. This is the same as a local `psql`.
 
-It also reads the usual `PG*` variables when set: `PGHOST`, `PGPORT`,
-`PGUSER`, `PGPASSWORD`, `PGDATABASE` and `PGSSLMODE`.
+You can also run it as a different local OS user:
 
-To tune a remote server, use `-host` and `-port`, plus `-user` and
-`-password`. You can use the environment variables instead.
+```bash
+sudo -u app pgtune -db app
+```
+
+Changing the database is useful locally. Changing the host, port or password
+is not part of the supported setup. Keep pgtune on the same machine as
+PostgreSQL.
 
 ### Run it from a systemd timer
 
@@ -214,23 +221,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now pgtune.timer
 ```
 
-`Persistent=true` means a missed run starts after boot.
-
-For a remote database, add flags to `ExecStart`, or use an environment file:
-
-```ini
-# /etc/pgtune.env
-PGHOST=db.example.com
-PGUSER=pgtune
-PGPASSWORD=secret
-```
-
-```ini
-[Service]
-EnvironmentFile=/etc/pgtune.env
-```
-
-Keep that file private with `chmod 600`.
+`Persistent=true` means a missed run starts after boot. Change `OnCalendar`
+to run it more or less often.
 
 In an unattended run, think twice before adding `-apply-index`. It creates
 indexes, which takes time and adds load.
@@ -247,26 +239,23 @@ pgtune connects like a local `psql`. It uses the unix socket, your OS user, and
 peer authentication.
 
 If you run it as the `postgres` OS user, it is the same as
-`sudo -u postgres psql`.
-
-For a remote server or TCP, use `-host`, `-port`, `-user` and `-password`.
+`sudo -u postgres psql`. This local socket setup is the only supported one.
 
 ### Read the system
 
-pgtune reads RAM, CPU and disk type from the **database host**, not from the
-machine you run it on. It uses `pg_read_file` and `pg_ls_dir` to read
-`/proc/meminfo`, `/proc/cpuinfo`, `/proc/mounts` and `/sys/block/*`.
+pgtune reads RAM, CPU and disk type from the database host. It uses
+`pg_read_file` and `pg_ls_dir` to read `/proc/meminfo`, `/proc/cpuinfo`,
+`/proc/mounts` and `/sys/block/*`.
 
-A local `psql` session can read the same files. So the numbers are still
-correct when you connect remotely.
+Because pgtune runs on the database server, these are the real numbers for the
+machine that runs PostgreSQL.
 
 - LVM, `md` and device-mapper disks are traced down to the real physical disk.
 - Overlay mounts are resolved through `upperdir`.
 - Mixed or unknown storage is reported as `UNKNOWN`. The cost settings then
   stay at PostgreSQL defaults.
-- Reading these files needs superuser. Without it, RAM and CPU come from your
-  local machine instead, with a warning for remote connections. Disk detection
-  falls back only for local connections.
+- Reading these files needs superuser. Without it, pgtune falls back to reading
+  RAM and CPU from the local machine.
 - `-ram` sets RAM yourself. `-disk ssd` or `-disk hdd` sets the disk type.
 
 ### Read the database
@@ -371,7 +360,10 @@ database needs its own view.
 
 ## Options
 
-These flags are the same for a local build and for the installed binary.
+These flags are the same for a local build and for the installed binary. pgtune
+is meant to run on the database server, so the default local socket connection
+is all you need. The `-host`, `-port`, `-password` and `-sslmode` flags are
+still shown below, but they are not for pointing pgtune at another machine.
 
 ```
 pgtune [flags]
@@ -403,9 +395,9 @@ Examples:
 
 ```bash
 pgtune                                      # local socket as your OS user
-PGPASSWORD=postgres pgtune -host 127.0.0.1 -user postgres   # TCP
+sudo -u app pgtune -db app                  # a local OS user and database
 pgtune -workload olap -apply -analyze       # analytics auto-tune
-pgtune -disk ssd                            # force SSD on a VM or cloud disk
+pgtune -disk ssd                            # for a wrongly reported disk
 pgtune -apply-index                         # create recommended indexes
 pgtune -all-dbs                             # every database on the server
 ```
@@ -452,8 +444,11 @@ GRANT pg_read_all_stats TO pgtune;
 Then run pgtune as that role:
 
 ```bash
-PGUSER=pgtune PGPASSWORD=pgtune pgtune -all-dbs
+pgtune -user pgtune -password pgtune -all-dbs
 ```
+
+This needs a local `pg_hba.conf` rule that accepts the role and password. With
+peer authentication, run pgtune as an OS user with the same name instead.
 
 Databases you cannot connect to are listed as skipped. The `postgres`
 maintenance database is analyzed like any other.
