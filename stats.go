@@ -112,8 +112,26 @@ func collectSysStats(ctx context.Context, conn *pgx.Conn, opts Options) (*SysSta
 		}
 	}
 
-	if sys.DiskType = detectDiskTypeServer(ctx, conn, sys.DataDir); sys.DiskType == "" {
-		sys.DiskType = detectDiskType(sys.DataDir) // client-side fallback
+	// An explicit -disk ssd/hdd wins over detection (useful for VMs and cloud
+	// volumes whose virtual disk advertises rotational=1 despite sitting on
+	// SSD/NVMe storage).
+	if opts.Disk == "ssd" || opts.Disk == "hdd" {
+		sys.DiskType = opts.Disk
+		return sys, nil
+	}
+
+	// Disk detection runs on the database server host through pg_read_file /
+	// pg_ls_dir. Only for a local connection is the client a valid fallback;
+	// for a remote non-superuser, the client's disks describe a different
+	// machine, so report unknown instead of guessing.
+	sys.DiskType = detectDiskTypeServer(ctx, conn, sys.DataDir)
+	if sys.DiskType == "" || (sys.DiskType == "unknown" && localHost(opts.Host)) {
+		if local := detectDiskType(sys.DataDir); local != "" {
+			sys.DiskType = local
+		}
+	}
+	if sys.DiskType == "" {
+		sys.DiskType = "unknown"
 	}
 	return sys, nil
 }
@@ -128,6 +146,26 @@ func serverFile(ctx context.Context, conn *pgx.Conn, path string) (string, error
 		return "", err
 	}
 	return content, nil
+}
+
+// serverListDir lists a directory on the database server host through
+// pg_ls_dir (superuser-only, like pg_read_file). Used to enumerate
+// /sys/block and its slaves/ directories.
+func serverListDir(ctx context.Context, conn *pgx.Conn, path string) ([]string, error) {
+	rows, err := conn.Query(ctx, "SELECT pg_ls_dir($1)", path)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
 }
 
 // memTotalFrom parses MemTotal (in kB) from /proc/meminfo content.
@@ -177,6 +215,20 @@ var ramSuffixes = []struct {
 	{"MB", 1 << 20},
 	{"KB", 1 << 10},
 	{"B", 1},
+}
+
+// parseDiskOverride validates a -disk value. "auto" (or empty) keeps
+// detection; "ssd"/"hdd" force the storage class regardless of sysfs.
+func parseDiskOverride(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "auto":
+		return "auto", nil
+	case "ssd":
+		return "ssd", nil
+	case "hdd":
+		return "hdd", nil
+	}
+	return "", fmt.Errorf("unknown disk type %q (want auto, ssd or hdd)", s)
 }
 
 // parseRam converts a -ram value ("32GB", "16384MB", "16777216") to bytes.
@@ -297,50 +349,267 @@ func readMemTotalKB() (uint64, error) {
 	return memTotalFrom(string(b))
 }
 
-// detectDiskType resolves the block device that hosts the data directory and
-// reports whether it is rotational (HDD) or not (SSD). Falls back to scanning
-// all block devices when the mapping is not resolvable (e.g. overlay mounts).
-func detectDiskType(dataDir string) string {
-	if dev := deviceForPath(dataDir); dev != "" {
-		if r, ok := rotationalOf(dev); ok {
-			if r == 0 {
-				return "ssd"
-			}
-			return "hdd"
+// sysFS abstracts the /sys filesystem so the same storage-detection logic can
+// run on the local client (os.ReadFile/os.ReadDir) or on the database server
+// host (pg_read_file/pg_ls_dir). Paths are relative to /sys.
+type sysFS interface {
+	ReadFile(path string) (string, error)
+	ListDir(path string) ([]string, error)
+}
+
+type localSysFS struct{}
+
+func (localSysFS) ReadFile(path string) (string, error) {
+	b, err := os.ReadFile("/sys/" + path)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func (localSysFS) ListDir(path string) ([]string, error) {
+	entries, err := os.ReadDir("/sys/" + path)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names, nil
+}
+
+type serverSysFS struct {
+	ctx  context.Context
+	conn *pgx.Conn
+}
+
+func (s serverSysFS) ReadFile(path string) (string, error) {
+	return serverFile(s.ctx, s.conn, "/sys/"+path)
+}
+
+func (s serverSysFS) ListDir(path string) ([]string, error) {
+	return serverListDir(s.ctx, s.conn, "/sys/"+path)
+}
+
+// mountEntry is one row of /proc/mounts.
+type mountEntry struct {
+	source string
+	point  string
+	fstype string
+	opts   string
+}
+
+// parseMounts parses /proc/mounts content. Octal escapes in the device and
+// mount-point fields (spaces, tabs, newlines, backslashes) are decoded.
+func parseMounts(content string) []mountEntry {
+	var out []mountEntry
+	for _, line := range strings.Split(content, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 {
+			continue
+		}
+		out = append(out, mountEntry{
+			source: unescapeMountField(f[0]),
+			point:  unescapeMountField(f[1]),
+			fstype: f[2],
+			opts:   f[3],
+		})
+	}
+	return out
+}
+
+func unescapeMountField(s string) string {
+	return strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`).Replace(s)
+}
+
+// mountForPath returns the most specific mount holding path. Root ("/")
+// matches everything; other mount points match on a component boundary
+// ("/var/lib" must not claim "/var/libx").
+func mountForPath(path string, mounts []mountEntry) (mountEntry, bool) {
+	if !strings.HasPrefix(path, "/") {
+		return mountEntry{}, false
+	}
+	var best mountEntry
+	bestLen := -1
+	for _, m := range mounts {
+		if m.point != "/" && path != m.point && !strings.HasPrefix(path, m.point+"/") {
+			continue
+		}
+		if len(m.point) > bestLen {
+			best, bestLen = m, len(m.point)
 		}
 	}
-	hasSSD, hasHDD := false, false
-	entries, err := os.ReadDir("/sys/block")
-	if err != nil {
+	if bestLen < 0 {
+		return mountEntry{}, false
+	}
+	return best, true
+}
+
+// overlayUpperDir extracts upperdir= from an overlay mount's options.
+func overlayUpperDir(opts string) string {
+	for _, o := range strings.Split(opts, ",") {
+		if strings.HasPrefix(o, "upperdir=") {
+			return unescapeMountField(strings.TrimPrefix(o, "upperdir="))
+		}
+	}
+	return ""
+}
+
+// isNetworkFS reports filesystems whose backing device cannot be described by
+// a local /sys/block entry.
+func isNetworkFS(fstype string) bool {
+	switch fstype {
+	case "nfs", "nfs4", "cifs", "smbfs", "ceph", "glusterfs", "9p",
+		"afs", "lustre", "virtiofs":
+		return true
+	}
+	return strings.HasPrefix(fstype, "nfs") ||
+		strings.HasPrefix(fstype, "fuse") ||
+		strings.HasPrefix(fstype, "smb")
+}
+
+const maxStorageDepth = 4
+
+// storageClassForPath resolves path to a mount, then to the block device(s)
+// behind it. It returns "" when no mount matches (the caller may fall back to
+// scanning all devices) and "unknown" when a mount exists but its storage
+// cannot be determined (overlay without upperdir, tmpfs, network, ...).
+func storageClassForPath(fs sysFS, mounts []mountEntry, path string, depth int) string {
+	if depth > maxStorageDepth {
 		return "unknown"
 	}
+	m, ok := mountForPath(path, mounts)
+	if !ok {
+		return ""
+	}
+	switch m.fstype {
+	case "overlay":
+		upper := overlayUpperDir(m.opts)
+		if upper == "" {
+			return "unknown"
+		}
+		if c := storageClassForPath(fs, mounts, upper, depth+1); c != "" {
+			return c
+		}
+		return "unknown"
+	case "tmpfs", "ramfs", "devtmpfs":
+		return "unknown"
+	}
+	if isNetworkFS(m.fstype) {
+		return "unknown"
+	}
+	name, ok := deviceNameFromSource(fs, m.source)
+	if !ok {
+		return "unknown"
+	}
+	return storageClassForDevice(fs, name)
+}
+
+// deviceNameFromSource maps a /proc/mounts source to a /sys/block device name.
+// It understands /dev/sda1, /dev/nvme0n1p1, /dev/dm-0, /dev/md0,
+// /dev/mapper/<name> and /dev/<vg>/<lv> (LVM uses <vg>-<lv> as dm name).
+func deviceNameFromSource(fs sysFS, source string) (string, bool) {
+	base := strings.TrimPrefix(source, "/dev/")
+	if base == source {
+		return "", false
+	}
+	if strings.HasPrefix(base, "mapper/") {
+		return dmDeviceByName(fs, strings.TrimPrefix(base, "mapper/"))
+	}
+	if strings.HasPrefix(base, "disk/") || strings.HasPrefix(base, "by-") {
+		// /dev/disk/by-* symlinks need readlink, which the server-side
+		// backend cannot do; treat as unresolved rather than guessing.
+		return "", false
+	}
+	if strings.Contains(base, "/") {
+		return dmDeviceByName(fs, strings.ReplaceAll(base, "/", "-"))
+	}
+	return deviceName(base), true
+}
+
+// dmDeviceByName finds the dm-N device whose /sys/block/dm-*/dm/name equals
+// want (e.g. "vg-root").
+func dmDeviceByName(fs sysFS, want string) (string, bool) {
+	entries, err := fs.ListDir("block")
+	if err != nil {
+		return "", false
+	}
 	for _, e := range entries {
-		if r, ok := rotationalOf(e.Name()); ok {
-			if r == 0 {
-				hasSSD = true
-			} else {
-				hasHDD = true
-			}
+		if !strings.HasPrefix(e, "dm-") {
+			continue
+		}
+		name, err := fs.ReadFile("block/" + e + "/dm/name")
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(name) == want {
+			return e, true
+		}
+	}
+	return "", false
+}
+
+// storageClassForDevice follows device-mapper/md slaves down to the physical
+// leaves and classifies their rotational flags.
+func storageClassForDevice(fs sysFS, name string) string {
+	return storageClassFromRotational(leafRotational(fs, name, map[string]bool{}))
+}
+
+func leafRotational(fs sysFS, name string, path map[string]bool) []int {
+	if path[name] {
+		return []int{-1} // cycle
+	}
+	path[name] = true
+	defer delete(path, name)
+
+	if slaves, err := fs.ListDir("block/" + name + "/slaves"); err == nil && len(slaves) > 0 {
+		var vals []int
+		for _, s := range slaves {
+			vals = append(vals, leafRotational(fs, s, path)...)
+		}
+		return vals
+	}
+	if r, ok := rotationalOf(fs, name); ok {
+		return []int{r}
+	}
+	return []int{-1}
+}
+
+// storageClassFromRotational maps rotational flags (0 = SSD, 1 = HDD, other /
+// -1 = unknown) to a storage class. Mixed or partly unreadable devices are
+// reported as unknown instead of assuming SSD.
+func storageClassFromRotational(vals []int) string {
+	if len(vals) == 0 {
+		return "unknown"
+	}
+	sawSSD, sawHDD := false, false
+	for _, v := range vals {
+		switch v {
+		case 0:
+			sawSSD = true
+		case 1:
+			sawHDD = true
+		default:
+			return "unknown"
 		}
 	}
 	switch {
-	case hasSSD && !hasHDD:
+	case sawSSD && !sawHDD:
 		return "ssd"
-	case hasHDD && !hasSSD:
+	case sawHDD && !sawSSD:
 		return "hdd"
-	case hasSSD && hasHDD:
-		return "ssd" // mixed storage: prefer SSD assumptions
 	default:
 		return "unknown"
 	}
 }
 
-func rotationalOf(name string) (int, bool) {
-	b, err := os.ReadFile("/sys/block/" + name + "/queue/rotational")
+func rotationalOf(fs sysFS, name string) (int, bool) {
+	content, err := fs.ReadFile("block/" + name + "/queue/rotational")
 	if err != nil {
 		return 0, false
 	}
-	return rotationalFromContent(string(b))
+	return rotationalFromContent(content)
 }
 
 // rotationalFromContent parses a /sys/block/<dev>/queue/rotational file
@@ -355,45 +624,51 @@ func rotationalFromContent(content string) (int, bool) {
 	return 0, false
 }
 
-// deviceForPath maps a path to its backing device name (e.g. "nvme0n1")
-// using /proc/mounts. Returns "" when it cannot be resolved.
-func deviceForPath(path string) string {
-	mounts, err := os.ReadFile("/proc/mounts")
+// scanAllDevices is the last-resort fallback when no mount maps the data
+// directory. Virtual devices (loop, ram, zram, optical, floppy) are ignored;
+// mixed or unreadable devices yield unknown.
+func scanAllDevices(fs sysFS) string {
+	entries, err := fs.ListDir("block")
 	if err != nil {
-		return ""
+		return "unknown"
 	}
-	return deviceForPathFromMounts(path, string(mounts))
-}
-
-// deviceForPathFromMounts maps a path to its backing device name (e.g.
-// "nvme0n1") from /proc/mounts content. Returns "" when it cannot be resolved.
-func deviceForPathFromMounts(path, mountsContent string) string {
-	bestDev, bestLen := "", 0
-	for _, line := range strings.Split(mountsContent, "\n") {
-		f := strings.Fields(line)
-		if len(f) < 2 {
+	var vals []int
+	for _, e := range entries {
+		if skipBlockDevice(e) {
 			continue
 		}
-		dev, mnt := f[0], f[1]
-		// match on a component boundary ("/var/lib" must not claim
-		// "/var/libx"); the root mount "/" legitimately matches everything
-		if mnt != "/" {
-			if !strings.HasPrefix(path, mnt+"/") && path != mnt {
-				continue
-			}
-		}
-		if len(mnt) <= bestLen {
-			continue // longest mount wins
-		}
-		if !strings.HasPrefix(dev, "/dev/") {
-			continue // skip overlay, tmpfs, proc, ...
-		}
-		bestDev, bestLen = dev, len(mnt)
+		vals = append(vals, leafRotational(fs, e, map[string]bool{})...)
 	}
-	if bestDev == "" {
-		return ""
+	return storageClassFromRotational(vals)
+}
+
+func skipBlockDevice(name string) bool {
+	for _, p := range []string{"loop", "ram", "zram", "sr", "fd"} {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
 	}
-	return deviceName(bestDev)
+	return false
+}
+
+// detectDiskTypeWith classifies the storage behind dataDir from /proc/mounts
+// content using the given /sys backend. Returns "ssd", "hdd" or "unknown".
+func detectDiskTypeWith(fs sysFS, mountsContent, dataDir string) string {
+	if dataDir != "" {
+		if c := storageClassForPath(fs, parseMounts(mountsContent), dataDir, 0); c != "" {
+			return c
+		}
+	}
+	return scanAllDevices(fs)
+}
+
+// detectDiskType resolves the storage class on the client host.
+func detectDiskType(dataDir string) string {
+	mounts, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return scanAllDevices(localSysFS{})
+	}
+	return detectDiskTypeWith(localSysFS{}, string(mounts), dataDir)
 }
 
 // deviceName strips the /dev/ prefix and any partition suffix from a block
@@ -432,26 +707,14 @@ func isDigits(s string) bool {
 }
 
 // detectDiskTypeServer resolves the storage class from the server host itself
-// (via pg_read_file), so remote connections get the right ssd/hdd assumption.
-// Returns "" when the server-side files are unreadable (non-superuser) or the
-// data directory cannot be mapped to a device; callers fall back to the
-// client-side detection.
+// (via pg_read_file/pg_ls_dir), so remote connections get the right ssd/hdd
+// assumption. Returns "" when the server-side files are unreadable
+// (non-superuser); callers then use the client-side fallback only for local
+// connections.
 func detectDiskTypeServer(ctx context.Context, conn *pgx.Conn, dataDir string) string {
 	mounts, err := serverFile(ctx, conn, "/proc/mounts")
 	if err != nil {
 		return ""
 	}
-	dev := deviceForPathFromMounts(dataDir, mounts)
-	if dev == "" {
-		return ""
-	}
-	if content, err := serverFile(ctx, conn, "/sys/block/"+dev+"/queue/rotational"); err == nil {
-		if r, ok := rotationalFromContent(content); ok {
-			if r == 0 {
-				return "ssd"
-			}
-			return "hdd"
-		}
-	}
-	return ""
+	return detectDiskTypeWith(serverSysFS{ctx: ctx, conn: conn}, mounts, dataDir)
 }

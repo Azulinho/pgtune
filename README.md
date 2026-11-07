@@ -42,13 +42,20 @@ make load           # generate workload, then re-run pgtune to see analysis
    application role.
 
 2. **Collect stats**
-   - System: RAM, CPU, disk type (SSD/HDD) read from the **database server
-     host** via `pg_read_file` (`/proc/meminfo`, `/proc/cpuinfo`,
-     `/proc/mounts`) — the same file access a local postgres user's psql
-     session has, so tuning is correct even over a remote connection.
-     `pg_read_file` needs superuser; other roles fall back to the client
-     host's `/proc` (warned about when the connection is not local) — use
-     `-ram` to be explicit.
+   - System: RAM, CPU and storage class (SSD/HDD) read from the **database
+     server host** via `pg_read_file`/`pg_ls_dir` (`/proc/meminfo`,
+     `/proc/cpuinfo`, `/proc/mounts`, `/sys/block/*`) — the same file access
+     a local postgres user's psql session has, so tuning is correct even
+     over a remote connection. Device-mapper/LVM/md devices are followed
+     through their `slaves/` to the physical disks, and overlay mounts are
+     resolved through `upperdir`. Mixed or undetectable storage is reported
+     as `UNKNOWN` and leaves the cost settings at PostgreSQL defaults. These
+     functions need superuser; for RAM/CPU, restricted roles fall back to the
+     client host's `/proc` (warned about when the connection is not local) —
+     disk detection does so only for a local connection, otherwise it reports
+     `UNKNOWN`. Use `-ram` to be explicit, and `-disk ssd|hdd` to override
+     detection (e.g. virtio/cloud disks that report `rotational=1` even when
+     backed by SSD/NVMe).
    - Server: `pg_stat_database` (hit ratio, commits, temp spill, deadlocks),
      `pg_stat_checkpointer`/`pg_stat_bgwriter` (checkpoint pressure),
      `pg_stat_user_tables` (seq vs index scans, dead tuples, last ANALYZE),
@@ -85,6 +92,11 @@ make load           # generate workload, then re-run pgtune to see analysis
    - shared_buffers raised when the cache hit ratio is low and the DB fits in RAM
    - max_wal_size / min_wal_size raised under checkpoint pressure
    - autovacuum_vacuum_scale_factor tightened when dead-tuple bloat is found
+   - cost/I/O constants by detected storage class: SSD →
+     `random_page_cost 1.1`, `seq_page_cost 1.0`,
+     `effective_io_concurrency 200`, `maintenance_io_concurrency 100`;
+     HDD → `4.0 / 1.0 / 2 / 2`. Unknown storage leaves all four at the
+     PostgreSQL defaults rather than guessing.
 
 5. **Apply** — `ALTER SYSTEM SET ...` for changed parameters, then reload.
    `ALTER SYSTEM` needs a superuser connection: with a non-superuser role the
@@ -149,6 +161,9 @@ pgtune [flags]
                         verify-ca | verify-full; PGSSLMODE (default "prefer")
   -ram string           total RAM override, e.g. 32GB (default: read from the
                         database server's /proc/meminfo)
+  -disk string          auto | ssd | hdd (default "auto": detect the data
+                        directory's disk; ssd/hdd override VMs and cloud
+                        volumes that misreport their rotational flag)
   -workload string      oltp | olap | mixed | desktop (default "oltp")
   -apply                apply the plan (ALTER SYSTEM + reload; needs superuser)
   -apply-index          create indexes recommended by seq-scan findings
@@ -174,6 +189,7 @@ PGPASSWORD=postgres ./pgtune -host 127.0.0.1 -user postgres   # TCP, postgres su
 ./pgtune -sslmode require                  # TLS to the server
 ./pgtune -port 5432 -user app -password app -db app   # as the app role
 ./pgtune -workload olap -apply -analyze    # full analytics auto-tune
+./pgtune -disk ssd                         # force SSD cost model (VM/cloud disk)
 ./pgtune -apply-index                      # create recommended indexes
 ./pgtune -apply                            # non-superuser: prints the SQL to run
 ./pgtune -explain 0                        # skip EXPLAIN (faster, read-only)

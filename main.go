@@ -39,6 +39,7 @@ type Options struct {
 	ApplyIndex     bool
 	AllDBs         bool
 	Ram            string
+	Disk           string
 }
 
 // envOr returns the named environment variable, or def when unset/empty.
@@ -84,6 +85,7 @@ func main() {
 	flag.StringVar(&opts.DB, "db", envOr("PGDATABASE", "postgres"), "Database to analyze")
 	flag.StringVar(&opts.SslMode, "sslmode", envOr("PGSSLMODE", "prefer"), "SSL mode: disable, allow, prefer, require, verify-ca, verify-full")
 	flag.StringVar(&opts.Ram, "ram", "", "Total RAM override, e.g. 32GB (default: read from /proc/meminfo)")
+	flag.StringVar(&opts.Disk, "disk", "auto", "Storage type override: auto, ssd, hdd (default: detect the data directory's disk)")
 	flag.StringVar(&opts.Workload, "workload", "oltp", "Workload type: oltp, olap, mixed, desktop")
 	flag.BoolVar(&opts.Apply, "apply", false, "Apply the tuning plan (ALTER SYSTEM + reload)")
 	flag.IntVar(&opts.TopN, "top", 8, "number of top queries to report from pg_stat_statements")
@@ -111,6 +113,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: -timeout must be > 0\n")
 		os.Exit(1)
 	}
+
+	disk, err := parseDiskOverride(opts.Disk)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	opts.Disk = disk
 
 	ctx := context.Background()
 

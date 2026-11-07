@@ -154,7 +154,9 @@ func TestBuildPlanBaselineOLTP(t *testing.T) {
 		"checkpoint_completion_target": "0.9",
 		"autovacuum_max_workers":       "3",
 		"random_page_cost":             "1.1",
+		"seq_page_cost":                "1",
 		"effective_io_concurrency":     "200",
+		"maintenance_io_concurrency":   "100",
 	}
 	for name, want := range expect {
 		it := planItem(t, plan, name)
@@ -179,8 +181,32 @@ func TestBuildPlanOLAPUsesLargerSharedBuffers(t *testing.T) {
 	if got := planItem(t, plan, "random_page_cost").Proposed; got != "4" {
 		t.Errorf("HDD random_page_cost = %q, want 4", got)
 	}
+	if got := planItem(t, plan, "seq_page_cost").Proposed; got != "1" {
+		t.Errorf("HDD seq_page_cost = %q, want 1", got)
+	}
 	if got := planItem(t, plan, "effective_io_concurrency").Proposed; got != "2" {
 		t.Errorf("HDD effective_io_concurrency = %q, want 2", got)
+	}
+	if got := planItem(t, plan, "maintenance_io_concurrency").Proposed; got != "2" {
+		t.Errorf("HDD maintenance_io_concurrency = %q, want 2", got)
+	}
+}
+
+// Unknown storage must leave the cost constants at PostgreSQL's defaults
+// rather than assuming SSD or HDD.
+func TestBuildPlanUnknownStorageSkipsCostSettings(t *testing.T) {
+	sys := &SysStats{TotalMemBytes: 8 * GiB, NumCPU: 4, DiskType: "unknown"}
+	plan := buildPlan(sys, mkDB(), WorkloadOLTP, nil)
+
+	for _, name := range []string{
+		"random_page_cost", "seq_page_cost",
+		"effective_io_concurrency", "maintenance_io_concurrency",
+	} {
+		for _, it := range plan {
+			if it.Name == name {
+				t.Errorf("%s must not be tuned for unknown storage (proposed %q)", name, it.Proposed)
+			}
+		}
 	}
 }
 

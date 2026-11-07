@@ -372,13 +372,19 @@ func buildPlan(sys *SysStats, db *DBStats, wl Workload, qa *QueryAnalysis) []Pla
 		addFloat("autovacuum_vacuum_scale_factor", "sighup", "dead-tuple bloat detected", 0.05)
 	}
 
+	// Cost constants follow the detected storage class. Unknown storage leaves
+	// them at the PostgreSQL defaults rather than guessing.
 	switch sys.DiskType {
 	case "ssd":
 		addFloat("random_page_cost", "user", "SSD storage", 1.1)
+		addFloat("seq_page_cost", "user", "SSD storage", 1.0)
 		addInt("effective_io_concurrency", "user", "SSD storage", 200)
+		addInt("maintenance_io_concurrency", "sighup", "SSD storage", 100)
 	case "hdd":
 		addFloat("random_page_cost", "user", "HDD storage", 4.0)
+		addFloat("seq_page_cost", "user", "HDD storage", 1.0)
 		addInt("effective_io_concurrency", "user", "HDD storage", 2)
+		addInt("maintenance_io_concurrency", "sighup", "HDD storage", 2)
 	}
 
 	return items
