@@ -480,14 +480,15 @@ benchmark, so the stats start from zero.
 
 | File | Purpose |
 |---|---|
-| `main.go` | CLI entry and orchestration |
-| `stats.go` | System and live PostgreSQL statistics |
-| `queries.go` | pg_stat_statements, long queries, EXPLAIN, findings |
-| `alldbs.go` | Database discovery, per-DB collection, aggregation |
-| `tune.go` | Tuning formulas and evidence-based adjustments |
-| `apply.go` | ALTER SYSTEM, reload, pg_stat_statements install, ANALYZE |
-| `report.go` | Terminal report |
-| `*_test.go` | Unit tests for plan math, EXPLAIN and DDL parsing |
+| `src/main.go` | CLI entry and orchestration |
+| `src/stats.go` | System and live PostgreSQL statistics |
+| `src/queries.go` | pg_stat_statements, long queries, EXPLAIN, findings |
+| `src/alldbs.go` | Database discovery, per-DB collection, aggregation |
+| `src/tune.go` | Tuning formulas and evidence-based adjustments |
+| `src/apply.go` | ALTER SYSTEM, reload, pg_stat_statements install, ANALYZE |
+| `src/report.go` | Terminal report |
+| `src/*_test.go` | Unit tests for plan math, EXPLAIN and DDL parsing |
+| `go.mod`, `go.sum` | Go module definition and dependencies |
 | `Makefile` | Development build, tune and load-test targets |
 | `README.md` | This file |
 

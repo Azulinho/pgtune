@@ -70,7 +70,7 @@ help:
 
 ## Compile the pgtune binary.
 build:
-	$(GO) build -o pgtune .
+	$(GO) build -o pgtune ./src
 
 ## Run the unit tests (pure logic: plan math, EXPLAIN analysis, DDL parsing).
 test:

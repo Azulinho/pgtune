@@ -77,7 +77,7 @@ jobs:
             name="pgtune-${VERSION}-${goos}-${goarch}"
             GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 go build -trimpath \
               -ldflags "-s -w -X main.version=${VERSION#v}" \
-              -o "dist/${name}" .
+              -o "dist/${name}" ./src
             (cd dist && sha256sum "${name}" >> checksums.txt)
           done
 
