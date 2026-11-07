@@ -48,6 +48,9 @@ sudo rpm -U pgtune-<version>-1.x86_64.rpm
 The packages install the static binary to `/usr/bin/pgtune` and the docs to
 `/usr/share/doc/pgtune/`.
 
+Every push to `main` creates the next `0.<YYYYMM>.<N>` tag and publishes the
+packages for it automatically.
+
 ## How it works
 
 1. **Connect** — like a local `psql`: unix socket, role = current OS user,

@@ -1,0 +1,56 @@
+name: tag
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  actions: write
+
+# Serialize runs so two quick pushes cannot compute the same next tag.
+concurrency:
+  group: auto-tag
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: create and push tag
+        id: tag
+        run: |
+          set -euo pipefail
+          month="$(date -u +%Y%m)"
+          prefix="0.${month}."
+          latest="$(git tag --list "${prefix}*" | sort -V | tail -n1)"
+          if [ -z "${latest}" ]; then
+            next=0
+          else
+            next=$(( ${latest##*.} + 1 ))
+          fi
+          tag="${prefix}${next}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${tag}" -m "Release ${tag}"
+          git push origin "${tag}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: trigger release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Tags pushed with GITHUB_TOKEN do not trigger other workflows, so
+          # dispatch the release explicitly for the new tag.
+          gh workflow run release.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${TAG}" \
+            -f version="${TAG}" \
+            -f publish=true
