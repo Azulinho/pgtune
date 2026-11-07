@@ -74,6 +74,12 @@ gpg --show-keys --with-fingerprint \
   /usr/share/keyrings/pgtune-archive-keyring.gpg
 ```
 
+The current signing key fingerprint is:
+
+```
+D158 CA36 D983 0B4F 3357 8654 305D CC1B FAD4 2079
+```
+
 Remove the package and the repository configuration:
 
 ```bash
