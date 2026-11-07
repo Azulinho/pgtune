@@ -7,7 +7,7 @@ It connects to your database, looks at what is really happening, and works out
 a set of settings. If you ask it to, it applies those settings for you.
 
 pgtune never restarts PostgreSQL. If a change needs a restart, it tells you and
-you do it yourself.
+you do it yourself. You can run it by hand, from cron, or from a systemd timer.
 
 ## Requirements
 
@@ -123,7 +123,25 @@ sudo rpm -U pgtune-<version>-1.x86_64.rpm
 Every push to `main` creates the next `0.<YYYYMM>.<N>` tag and publishes new
 packages for it.
 
-## First run
+## Two ways to run pgtune
+
+There are two ways to use pgtune. Pick the one that matches what you are
+doing.
+
+| How | Use it for | Connection |
+|---|---|---|
+| `make <target>` | Development in this repository | Fixed to `postgres/postgres` over TCP 127.0.0.1:5432 |
+| `pgtune <flags>` | Real servers, cron and systemd timers | Unix socket as your OS user, or `PG*` variables and flags |
+
+The `make` targets are a convenience for working on this project. They are not
+for production.
+
+The installed binary is the tool you run on a server. It works like `psql` and
+is safe to run on a schedule.
+
+## Development: the make targets
+
+Run these from a clone of this repository:
 
 ```bash
 make build          # compile
@@ -132,19 +150,94 @@ make tune-restart   # install pg_stat_statements, apply, ANALYZE
 make load           # generate a workload, then run pgtune again
 ```
 
+`make help` lists every target.
+
+These targets connect to `postgres/postgres` over TCP on 127.0.0.1:5432. Use
+them only for local development.
+
 `make tune-restart` needs one manual restart of PostgreSQL the first time. That
 is because `pg_stat_statements` is loaded at server start.
 
-The `make` targets are only for local development. They connect to
-`postgres/postgres` over TCP on 127.0.0.1:5432.
+## On a server: run pgtune directly
 
-The `pgtune` binary itself behaves like a local `psql`. By default it uses the
-unix socket and connects as your current OS user. There is no password. It
-reads the usual `PG*` variables if you set them: `PGHOST`, `PGPORT`, `PGUSER`,
-`PGPASSWORD`, `PGDATABASE` and `PGSSLMODE`.
+After you install the package, run `pgtune` itself. Do not use the Makefile on
+a server.
+
+```bash
+sudo -u postgres pgtune                      # show the plan, change nothing
+sudo -u postgres pgtune -apply -analyze      # apply the plan and ANALYZE
+sudo -u postgres pgtune -all-dbs -apply      # every database
+```
+
+By default pgtune uses the unix socket and connects as your current OS user.
+There is no password. This is the same as a local `psql`.
+
+It also reads the usual `PG*` variables when set: `PGHOST`, `PGPORT`,
+`PGUSER`, `PGPASSWORD`, `PGDATABASE` and `PGSSLMODE`.
 
 To tune a remote server, use `-host` and `-port`, plus `-user` and
 `-password`. You can use the environment variables instead.
+
+### Run it from a systemd timer
+
+A timer keeps the settings in check without you logging in. Create two units.
+
+```ini
+# /etc/systemd/system/pgtune.service
+[Unit]
+Description=pgtune PostgreSQL auto-tune
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=postgres
+ExecStart=/usr/bin/pgtune -apply -analyze
+```
+
+```ini
+# /etc/systemd/system/pgtune.timer
+[Unit]
+Description=Run pgtune every day
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Then enable the timer:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now pgtune.timer
+```
+
+`Persistent=true` means a missed run starts after boot.
+
+For a remote database, add flags to `ExecStart`, or use an environment file:
+
+```ini
+# /etc/pgtune.env
+PGHOST=db.example.com
+PGUSER=pgtune
+PGPASSWORD=secret
+```
+
+```ini
+[Service]
+EnvironmentFile=/etc/pgtune.env
+```
+
+Keep that file private with `chmod 600`.
+
+In an unattended run, think twice before adding `-apply-index`. It creates
+indexes, which takes time and adds load.
+
+Also think about `-install-pgss`. It is on by default. It needs
+`shared_preload_libraries` and one restart. Pass `-install-pgss=false` if you
+do not want pgtune to touch that.
 
 ## How it works
 
@@ -278,6 +371,8 @@ database needs its own view.
 
 ## Options
 
+These flags are the same for a local build and for the installed binary.
+
 ```
 pgtune [flags]
   -host string          PostgreSQL host; PGHOST (default: local unix socket,
@@ -307,12 +402,12 @@ pgtune [flags]
 Examples:
 
 ```bash
-./pgtune                                    # local socket as your OS user
-PGPASSWORD=postgres ./pgtune -host 127.0.0.1 -user postgres   # TCP
-./pgtune -workload olap -apply -analyze     # analytics auto-tune
-./pgtune -disk ssd                          # force SSD on a VM or cloud disk
-./pgtune -apply-index                       # create recommended indexes
-./pgtune -all-dbs                           # every database on the server
+pgtune                                      # local socket as your OS user
+PGPASSWORD=postgres pgtune -host 127.0.0.1 -user postgres   # TCP
+pgtune -workload olap -apply -analyze       # analytics auto-tune
+pgtune -disk ssd                            # force SSD on a VM or cloud disk
+pgtune -apply-index                         # create recommended indexes
+pgtune -all-dbs                             # every database on the server
 ```
 
 To skip `EXPLAIN` and run faster, use `-explain 0`.
@@ -330,9 +425,9 @@ and its own findings.
 One database may show no problems while another needs a new index.
 
 ```bash
-./pgtune -all-dbs          # analysis only
-./pgtune -all-dbs -apply   # instance plan + install pg_stat_statements everywhere
-./pgtune -all-dbs -analyze -apply-index   # per-database ANALYZE + indexes
+pgtune -all-dbs          # analysis only
+pgtune -all-dbs -apply   # instance plan + install pg_stat_statements everywhere
+pgtune -all-dbs -analyze -apply-index   # per-database ANALYZE + indexes
 ```
 
 ### Permissions
@@ -354,14 +449,19 @@ GRANT pg_read_all_stats TO pgtune;
 -- GRANT SELECT ON ALL TABLES IN SCHEMA public TO pgtune;
 ```
 
+Then run pgtune as that role:
+
 ```bash
-make tune-all PGPORT=5432 PGUSER=pgtune PGPASSWORD=pgtune
+PGUSER=pgtune PGPASSWORD=pgtune pgtune -all-dbs
 ```
 
 Databases you cannot connect to are listed as skipped. The `postgres`
 maintenance database is analyzed like any other.
 
 ## Load testing
+
+Load testing uses the `make` targets and `pgbench`. It is a development tool,
+not part of a server setup.
 
 ```bash
 make load                 # 20 clients, 8 threads, 60s, creates the schema
@@ -393,7 +493,7 @@ benchmark, so the stats start from zero.
 | `apply.go` | ALTER SYSTEM, reload, pg_stat_statements install, ANALYZE |
 | `report.go` | Terminal report |
 | `*_test.go` | Unit tests for plan math, EXPLAIN and DDL parsing |
-| `Makefile` | Build, tune and load-test targets |
+| `Makefile` | Development build, tune and load-test targets |
 | `README.md` | This file |
 
 `make test` runs the unit tests. It does not need a database.
