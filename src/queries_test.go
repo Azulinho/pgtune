@@ -76,18 +76,43 @@ func TestFilterColumn(t *testing.T) {
 
 func TestIndexDDLForFilter(t *testing.T) {
 	ddl := indexDDLForFilter("public.pgbench_accounts", "(abalance < 1)")
-	want := "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pgbench_accounts_abalance ON public.pgbench_accounts (abalance);"
+	want := `CREATE INDEX CONCURRENTLY IF NOT EXISTS "idx_pgbench_accounts_abalance" ON "public"."pgbench_accounts" ("abalance");`
 	if ddl != want {
 		t.Errorf("indexDDLForFilter = %q, want %q", ddl, want)
 	}
 	// unqualified table still gets the public schema in the DDL
 	ddl = indexDDLForFilter("pgbench_accounts", "(abalance < 1)")
-	if !strings.Contains(ddl, "ON public.pgbench_accounts") {
+	if !strings.Contains(ddl, `ON "public"."pgbench_accounts"`) {
 		t.Errorf("unqualified DDL = %q, want public schema", ddl)
 	}
 	// expression filters must not produce a plain index
 	if ddl := indexDDLForFilter("public.t", "(lower(x) = 'a')"); ddl != "" {
 		t.Errorf("expression filter produced DDL %q, want empty", ddl)
+	}
+}
+
+func TestIndexDDLQuotesSpecialIdentifiers(t *testing.T) {
+	ddl := indexDDLForFilter("app.my-table", "(status = 'x')")
+	for _, want := range []string{`"app"."my-table"`, `("status")`, `"idx_my-table_status"`} {
+		if !strings.Contains(ddl, want) {
+			t.Errorf("indexDDLForFilter = %q, want it to contain %q", ddl, want)
+		}
+	}
+}
+
+func TestIndexNameFitsPostgresLimit(t *testing.T) {
+	name := indexName(strings.Repeat("t", 80), strings.Repeat("c", 80))
+	if len(name) > 63 {
+		t.Errorf("indexName length = %d, want <= 63 (%q)", len(name), name)
+	}
+}
+
+func TestIndexSelectivityNonPublicSchema(t *testing.T) {
+	tables := []TableStat{{Schema: "app", Table: "orders", Live: 1000}}
+	f := &Finding{Table: "app.orders", EstRows: 20}
+	est, total, ok := indexSelectivity(f, tables)
+	if !ok || est != 20 || total != 1000 {
+		t.Errorf("indexSelectivity = (%v, %v, %v), want (20, 1000, true)", est, total, ok)
 	}
 }
 

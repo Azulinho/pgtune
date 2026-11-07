@@ -56,7 +56,7 @@ func applyIndexes(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis) error 
 		}
 		fmt.Printf("created index on %s.%s (%s)\n", schema, table, col)
 		// refresh planner statistics so the new path is considered accurately
-		if _, err := conn.Exec(ctx, fmt.Sprintf("ANALYZE %s.%s;", schema, table)); err != nil {
+		if _, err := conn.Exec(ctx, fmt.Sprintf("ANALYZE %s;", quoteIdent(schema, table))); err != nil {
 			fmt.Printf("warning: ANALYZE %s.%s failed: %v\n", schema, table, err)
 		}
 		if q := topQueryByID(qa, f.QueryID); q != nil {
@@ -71,8 +71,7 @@ func applyIndexes(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis) error 
 func tableWriteHeavy(f *Finding, tables []TableStat) bool {
 	schema, table := splitTable(f.Table)
 	for _, t := range tables {
-		ts, tt := splitTable(t.Table)
-		if ts == schema && tt == table {
+		if t.Schema == schema && t.Table == table {
 			if t.Live <= 0 {
 				return false
 			}

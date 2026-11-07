@@ -59,8 +59,8 @@ func TestTableWriteHeavy(t *testing.T) {
 		{"public.accounts", true},
 		{"public.orders", false},
 		{"public.empty", false},
-		{"other.accounts", false},
 		{"public.missing", false},
+		{"other.accounts", true}, // same-named table in another schema
 	}
 	for _, c := range cases {
 		f := &Finding{Table: c.table}

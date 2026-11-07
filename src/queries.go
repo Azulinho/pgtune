@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -704,6 +707,27 @@ func splitTable(tbl string) (schema, table string) {
 	return "public", tbl
 }
 
+// quoteIdent renders one or more identifiers safely for DDL.
+func quoteIdent(parts ...string) string {
+	return pgx.Identifier(parts).Sanitize()
+}
+
+// indexName keeps generated index names within PostgreSQL's 63-byte identifier
+// limit and appends a short hash when truncation is needed.
+func indexName(table, col string) string {
+	name := "idx_" + table + "_" + col
+	if len(name) <= 63 {
+		return name
+	}
+	sum := sha256.Sum256([]byte(name))
+	suffix := "_" + hex.EncodeToString(sum[:4])
+	prefix := name[:63-len(suffix)]
+	for !utf8.ValidString(prefix) {
+		prefix = prefix[:len(prefix)-1]
+	}
+	return prefix + suffix
+}
+
 // filterColumn extracts the plain column name from a filter predicate such as
 // "(abalance < 1)" or "t.col BETWEEN 10 AND 20". Returns "" for expressions
 // (functions, casts) that would need an expression index instead.
@@ -732,8 +756,8 @@ func indexDDLForFilter(tbl, filter string) string {
 	if table == "" || col == "" {
 		return ""
 	}
-	return fmt.Sprintf("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_%s_%s ON %s.%s (%s);",
-		table, col, schema, table, col)
+	return fmt.Sprintf("CREATE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s (%s);",
+		quoteIdent(indexName(table, col)), quoteIdent(schema, table), quoteIdent(col))
 }
 
 // indexSelectivity reports the planner's estimated rows matching the filter
@@ -741,8 +765,7 @@ func indexDDLForFilter(tbl, filter string) string {
 func indexSelectivity(f *Finding, tables []TableStat) (est, total float64, ok bool) {
 	schema, table := splitTable(f.Table)
 	for _, t := range tables {
-		ts, tt := splitTable(t.Table)
-		if ts == schema && tt == table {
+		if t.Schema == schema && t.Table == table {
 			if t.Live <= 0 || f.EstRows < 0 {
 				return 0, 0, false
 			}
