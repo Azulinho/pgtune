@@ -1,0 +1,135 @@
+name: pages
+
+# Build the signed APT and RPM repositories from a published GitHub release and
+# deploy them to GitHub Pages. Dispatched by release.yml after the release
+# assets are uploaded.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag containing the .deb/.rpm packages"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  REPO_BASE_URL: https://azulinho.github.io/pgtune
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: download release packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          rm -rf dist _site
+          mkdir -p dist
+          # The release has just been created by another workflow run, so the
+          # assets can take a moment to become downloadable.
+          for attempt in 1 2 3 4 5; do
+            if gh release download "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern "*.deb" --pattern "*.rpm" \
+              --dir dist --clobber; then
+              break
+            fi
+            if [ "${attempt}" -eq 5 ]; then
+              echo "::error::could not download the release assets for ${TAG}"
+              exit 1
+            fi
+            echo "release assets not available yet (attempt ${attempt}); retrying"
+            sleep 5
+          done
+          find dist -maxdepth 1 \( -name "*.deb" -o -name "*.rpm" \) -print
+
+      - name: install repository tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gnupg reprepro createrepo-c rpm
+
+      - name: import signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "${HOME}/.gnupg"
+          printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg --batch --import
+          if [ -n "${GPG_PASSPHRASE}" ]; then
+            umask 077
+            printf '%s' "${GPG_PASSPHRASE}" > "${RUNNER_TEMP}/gpg-passphrase"
+            echo "GPG_PASSPHRASE_FILE=${RUNNER_TEMP}/gpg-passphrase" >> "${GITHUB_ENV}"
+          fi
+          key_id=$(gpg --batch --list-secret-keys --with-colons |
+            awk -F: '/^sec:/ { print $5; exit }')
+          if [ -z "${key_id}" ]; then
+            echo "::error::no secret key found after import; check the GPG_PRIVATE_KEY secret"
+            exit 1
+          fi
+          echo "GPG_KEY_ID=${key_id}" >> "${GITHUB_ENV}"
+
+      - name: build APT repository
+        run: |
+          set -euo pipefail
+          PKG_DIR=dist OUT_DIR=_site/deb \
+            packaging/repo/build-deb-repo.sh
+
+      - name: build RPM repository
+        run: |
+          set -euo pipefail
+          PKG_DIR=dist OUT_DIR=_site/rpm REPO_BASE_URL="${REPO_BASE_URL}" \
+            packaging/repo/build-rpm-repo.sh
+
+      - name: write landing page
+        run: |
+          set -euo pipefail
+          cat >_site/index.html <<'EOF'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <title>pgtune package repositories</title>
+          </head>
+          <body>
+            <h1>pgtune package repositories</h1>
+            <ul>
+              <li><a href="deb/">APT repository</a> (Debian, Ubuntu)</li>
+              <li><a href="rpm/">RPM repository</a> (RHEL, Fedora, openSUSE)</li>
+            </ul>
+            <p>Installation instructions are in the
+              <a href="https://github.com/Azulinho/pgtune#packages">README</a>.</p>
+          </body>
+          </html>
+          EOF
+
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

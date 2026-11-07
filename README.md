@@ -35,7 +35,95 @@ make load           # generate workload, then re-run pgtune to see analysis
 
 Release tags publish `.deb` and `.rpm` packages for `amd64`/`x86_64` and
 `arm64`/`aarch64`, plus raw `linux/amd64` and `linux/arm64` binaries, on the
-[Releases](https://github.com/Azulinho/pgtune/releases) page:
+[Releases](https://github.com/Azulinho/pgtune/releases) page.
+
+The same packages are available from signed APT and RPM repositories hosted on
+GitHub Pages, so `apt`, `dnf`, and `zypper` can install and upgrade `pgtune`
+directly. The packages contain a static binary with no runtime dependencies and
+install `/usr/bin/pgtune` plus docs in `/usr/share/doc/pgtune/`.
+
+The repositories always contain the latest release; older versions remain
+available on the Releases page.
+
+### APT repository (Debian, Ubuntu)
+
+Install the repository signing key and add the source:
+
+```bash
+curl -fsSL https://azulinho.github.io/pgtune/deb/pgtune-archive-keyring.gpg \
+  | sudo tee /usr/share/keyrings/pgtune-archive-keyring.gpg >/dev/null
+
+echo "deb [signed-by=/usr/share/keyrings/pgtune-archive-keyring.gpg] \
+https://azulinho.github.io/pgtune/deb stable main" \
+  | sudo tee /etc/apt/sources.list.d/pgtune.list
+```
+
+Then install or upgrade:
+
+```bash
+sudo apt update
+sudo apt install pgtune                 # first install
+sudo apt install --only-upgrade pgtune  # later upgrades
+```
+
+The repository contains `amd64` and `arm64` packages; APT selects the one that
+matches the host. To inspect the signing key:
+
+```bash
+gpg --show-keys --with-fingerprint \
+  /usr/share/keyrings/pgtune-archive-keyring.gpg
+```
+
+Remove the package and the repository configuration:
+
+```bash
+sudo apt remove pgtune
+sudo rm /etc/apt/sources.list.d/pgtune.list \
+  /usr/share/keyrings/pgtune-archive-keyring.gpg
+sudo apt update
+```
+
+### RPM repository (RHEL, Fedora, openSUSE)
+
+On Fedora, RHEL and compatible distributions, download the repo file and
+install:
+
+```bash
+sudo curl -fsSL -o /etc/yum.repos.d/pgtune.repo \
+  https://azulinho.github.io/pgtune/rpm/pgtune.repo
+sudo dnf install pgtune
+sudo dnf upgrade pgtune  # later upgrades
+```
+
+dnf imports the signing key on first use and prints its fingerprint. The
+repository metadata and the packages are both GPG-signed, and the repo file
+enables `gpgcheck` and `repo_gpgcheck`.
+
+On openSUSE, import the key and add the repository with zypper:
+
+```bash
+sudo rpm --import https://azulinho.github.io/pgtune/rpm/RPM-GPG-KEY-pgtune.asc
+sudo zypper addrepo --refresh https://azulinho.github.io/pgtune/rpm/ pgtune
+sudo zypper install pgtune
+sudo zypper update pgtune  # later upgrades
+```
+
+The RPM repository serves `x86_64` and `aarch64` packages from one URL; the
+package manager selects the matching architecture.
+
+Remove the package and the repository:
+
+```bash
+# Fedora / RHEL
+sudo dnf remove pgtune
+sudo rm /etc/yum.repos.d/pgtune.repo
+
+# openSUSE
+sudo zypper remove pgtune
+sudo zypper removerepo pgtune
+```
+
+### Manual install
 
 ```bash
 # Debian / Ubuntu
@@ -44,9 +132,6 @@ sudo dpkg -i pgtune_<version>-1_amd64.deb
 # RHEL / Fedora / openSUSE
 sudo rpm -U pgtune-<version>-1.x86_64.rpm
 ```
-
-The packages install the static binary to `/usr/bin/pgtune` and the docs to
-`/usr/share/doc/pgtune/`.
 
 Every push to `main` creates the next `0.<YYYYMM>.<N>` tag and publishes the
 packages for it automatically.

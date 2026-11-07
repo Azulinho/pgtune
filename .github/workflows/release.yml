@@ -17,6 +17,8 @@ on:
 
 permissions:
   contents: write
+  # Needed to dispatch the pages workflow after publishing.
+  actions: write
 
 jobs:
   release:
@@ -144,3 +146,10 @@ jobs:
               --title "${release_tag}" \
               --generate-notes
           fi
+          # The Pages deployment runs from main so it is not subject to tag-ref
+          # environment restrictions. Workflows triggered by GITHUB_TOKEN do
+          # not start other workflows, so dispatch it explicitly.
+          gh workflow run pages.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref main \
+            -f tag="${release_tag}"
