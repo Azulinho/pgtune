@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -52,6 +53,9 @@ func applyIndexes(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis) error 
 		}
 		if _, err := conn.Exec(ctx, f.IndexDDL); err != nil {
 			fmt.Printf("warning: could not create index (run manually as a table owner):\n  %s\n  (%v)\n", f.IndexDDL, err)
+			if name := indexNameFromDDL(f.IndexDDL); name != "" {
+				fmt.Printf("  a cancelled build can leave an INVALID index; check and drop it with:\n  DROP INDEX CONCURRENTLY IF EXISTS %s;\n", quoteIdent(schema, name))
+			}
 			continue
 		}
 		fmt.Printf("created index on %s.%s (%s)\n", schema, table, col)
@@ -90,6 +94,18 @@ func ddlColumn(ddl string) string {
 	col := strings.TrimSpace(ddl[i+1:])
 	col = strings.TrimSuffix(col, ");")
 	return strings.Trim(strings.TrimSpace(col), `"`)
+}
+
+var indexNameRe = regexp.MustCompile(`(?i)^CREATE\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?("[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)`)
+
+// indexNameFromDDL returns the index name from a CREATE INDEX statement, or ""
+// when the statement cannot be parsed.
+func indexNameFromDDL(ddl string) string {
+	m := indexNameRe.FindStringSubmatch(strings.TrimSpace(ddl))
+	if m == nil {
+		return ""
+	}
+	return strings.Trim(m[1], `"`)
 }
 
 // coveringIndex reports the name of an existing index whose first column is

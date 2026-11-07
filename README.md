@@ -386,6 +386,7 @@ pgtune [flags]
   -top int              number of top queries to show (default 8)
   -explain int          how many queries to EXPLAIN, 0 disables (default 3)
   -explain-timeout int  seconds allowed for EXPLAIN ANALYZE (default 5)
+  -index-timeout int    seconds allowed per CREATE INDEX, 0 = no limit (default 0)
   -long-running float   flag queries running longer than this (default 5)
   -timeout int          seconds allowed per database operation (default 60)
   -tables int           number of largest tables to analyze (default 10)

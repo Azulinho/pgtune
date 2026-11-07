@@ -101,3 +101,18 @@ func TestIndexDDLRoundTrip(t *testing.T) {
 		t.Errorf("DDL should be safe to re-run: %q", ddl)
 	}
 }
+
+func TestIndexNameFromDDL(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{`CREATE INDEX CONCURRENTLY IF NOT EXISTS "idx_t_a" ON "public"."t" ("a");`, "idx_t_a"},
+		{`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_t_a ON public.t (a);`, "idx_t_a"},
+		{"garbage", ""},
+	}
+	for _, c := range cases {
+		if got := indexNameFromDDL(c.in); got != c.want {
+			t.Errorf("indexNameFromDDL(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

@@ -30,6 +30,7 @@ type Options struct {
 	TopN           int
 	ExplainN       int
 	ExplainTimeout time.Duration
+	IndexTimeout   time.Duration
 	LongRunningSec float64
 	Timeout        time.Duration
 	TablesN        int
@@ -85,6 +86,7 @@ func main() {
 	opts := Options{}
 	var timeoutSec int
 	var explainTimeoutSec int
+	var indexTimeoutSec int
 	flag.StringVar(&opts.Host, "host", envOr("PGHOST", ""), "PostgreSQL host (default: local unix socket, like psql)")
 	flag.IntVar(&opts.Port, "port", envPort("PGPORT", 5432), "PostgreSQL port")
 	flag.StringVar(&opts.User, "user", envOr("PGUSER", defaultUser()), "PostgreSQL user (default: current OS user, like psql)")
@@ -98,6 +100,7 @@ func main() {
 	flag.IntVar(&opts.TopN, "top", 8, "number of top queries to report from pg_stat_statements")
 	flag.IntVar(&opts.ExplainN, "explain", 3, "how many top queries to EXPLAIN (0 disables)")
 	flag.IntVar(&explainTimeoutSec, "explain-timeout", 5, "seconds allowed for EXPLAIN ANALYZE execution (0 = no limit)")
+	flag.IntVar(&indexTimeoutSec, "index-timeout", 0, "seconds allowed per CREATE INDEX (0 = no limit)")
 	flag.Float64Var(&opts.LongRunningSec, "long-running", 5.0, "flag queries running longer than this many seconds")
 	flag.IntVar(&timeoutSec, "timeout", 60, "seconds allowed per database operation (connect, stats, query analysis, apply step)")
 	flag.IntVar(&opts.TablesN, "tables", 10, "number of largest tables to analyze")
@@ -116,6 +119,7 @@ func main() {
 
 	opts.Timeout = time.Duration(timeoutSec) * time.Second
 	opts.ExplainTimeout = time.Duration(explainTimeoutSec) * time.Second
+	opts.IndexTimeout = time.Duration(indexTimeoutSec) * time.Second
 	if opts.Timeout <= 0 {
 		fmt.Fprintf(os.Stderr, "error: -timeout must be > 0\n")
 		os.Exit(1)
@@ -225,7 +229,7 @@ func main() {
 	}
 
 	if opts.ApplyIndex {
-		actx, cancel := context.WithTimeout(ctx, opts.Timeout)
+		actx, cancel := opContext(ctx, opts.IndexTimeout)
 		err := applyIndexes(actx, conn, qa)
 		cancel()
 		if err != nil {
@@ -331,7 +335,7 @@ func runAllDBs(ctx context.Context, conn *pgx.Conn, opts Options, sys *SysStats,
 			if !ok {
 				continue
 			}
-			actx, cancel := context.WithTimeout(ctx, opts.Timeout)
+			actx, cancel := opContext(ctx, opts.IndexTimeout)
 			err := applyIndexes(actx, c, p.QA)
 			c.Close(actx)
 			cancel()
