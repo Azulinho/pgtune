@@ -39,10 +39,18 @@ const (
 
 var lockingClauseRe = regexp.MustCompile(`(?i)\bfor\s+(?:(?:no\s+)?key\s+)?(?:update|share)\b`)
 
+// cteDMLRe catches data-modifying CTE bodies, which start with WITH but still
+// write rows. selectIntoRe catches SELECT ... INTO, which creates a table.
+var (
+	cteDMLRe     = regexp.MustCompile(`(?i)\b(insert|update|delete|merge)\b`)
+	selectIntoRe = regexp.MustCompile(`(?i)\binto\b`)
+)
+
 // explainModeFor decides how a captured statement may be explored. Only
 // statements run by the connected role are executed; everything else gets a
-// plan-only EXPLAIN. DML and non-SELECT statements are skipped, and locking
-// clauses are never executed, regardless of ownership.
+// plan-only EXPLAIN. DML, data-modifying CTEs, SELECT INTO, non-SELECT
+// statements and statements containing SQL comments are never executed.
+// Locking clauses are also never executed, regardless of ownership.
 func explainModeFor(q TopQuery, currentUserID int64) ExplainMode {
 	sql := strings.TrimRight(strings.TrimSpace(q.Query), "; \t\n")
 	if sql == "" || dmlRe.MatchString(sql) {
@@ -52,7 +60,19 @@ func explainModeFor(q TopQuery, currentUserID int64) ExplainMode {
 	if !(strings.HasPrefix(low, "select") || strings.HasPrefix(low, "with")) {
 		return ExplainSkip
 	}
+	// Comments can hide a locking clause or a DML keyword from the regexes
+	// below. Treat any commented statement as plan-only rather than risk
+	// executing something the classifier did not understand.
+	if strings.Contains(sql, "/*") || strings.Contains(sql, "--") {
+		return ExplainPlanOnly
+	}
 	if lockingClauseRe.MatchString(sql) {
+		return ExplainPlanOnly
+	}
+	if strings.HasPrefix(low, "with") && cteDMLRe.MatchString(sql) {
+		return ExplainPlanOnly
+	}
+	if selectIntoRe.MatchString(sql) {
 		return ExplainPlanOnly
 	}
 	if currentUserID == 0 || q.UserID != currentUserID {
@@ -457,9 +477,10 @@ func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, o
 				done++
 				continue
 			}
-			if err := tx.Commit(ctx); err != nil {
-				return err
-			}
+			// EXPLAIN ANALYZE really executed the statement. Roll it back so
+			// side effects from anything the classifier missed do not persist;
+			// locks taken during execution are released here too.
+			_ = tx.Rollback(ctx)
 		}
 
 		var expl []jsonExplain
@@ -472,7 +493,7 @@ func explainTopQueries(ctx context.Context, conn *pgx.Conn, qa *QueryAnalysis, o
 		done++
 	}
 	if planOnly > 0 {
-		note := fmt.Sprintf("%d statement(s) from other roles were planned only (never executed as the connected role)", planOnly)
+		note := fmt.Sprintf("%d statement(s) were planned only (not executed)", planOnly)
 		if qa.Note != "" {
 			qa.Note += "; " + note
 		} else {

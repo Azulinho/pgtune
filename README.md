@@ -276,7 +276,9 @@ pgtune uses `pg_stat_statements`. If it is missing, pgtune installs it.
   latency.
 - It runs `EXPLAIN (ANALYZE, BUFFERS)` only on statements the connected role
   ran. Statements from other roles get a plain `EXPLAIN` and are never
-  executed. `FOR UPDATE`/`FOR SHARE` statements are never executed either.
+  executed. DML, data-modifying CTEs and `SELECT ... INTO` are never
+  executed. `FOR UPDATE`/`FOR SHARE` statements and statements containing SQL
+  comments are never executed either.
 - Queries with parameters get a plain `EXPLAIN`, using sample values from
   `pg_stats` so the planner estimate is realistic.
 - It reports things like full table scans with filters, sorts spilling to disk,
